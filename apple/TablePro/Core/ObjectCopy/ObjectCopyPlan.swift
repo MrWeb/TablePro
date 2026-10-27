@@ -61,6 +61,9 @@ internal struct ObjectCopyTableStep: Identifiable, Sendable {
     /// Set when this table is in the plan but part of it cannot run, so the sheet can say why
     /// before the user presses Copy.
     internal let note: String?
+    /// One count per foreign key this table is created with. Nil when a key cannot be checked,
+    /// which keeps the target's checks on for the rows.
+    internal let keyChecks: [ObjectCopyKeyCheck]?
 
     /// Spelled out rather than left to the memberwise init so the three fields a same-engine copy
     /// never sets can default. Every one of them describes something only a crossing or a
@@ -83,8 +86,10 @@ internal struct ObjectCopyTableStep: Identifiable, Sendable {
         coercer: CrossEngineValueCoercer? = nil,
         serverSideInsert: SyncStatement? = nil,
         hasRowFilter: Bool = false,
-        note: String?
+        note: String?,
+        keyChecks: [ObjectCopyKeyCheck]? = []
     ) {
+        self.keyChecks = keyChecks
         self.selection = selection
         self.dropStatements = dropStatements
         self.sequenceStatements = sequenceStatements
@@ -205,6 +210,12 @@ internal struct ObjectCopyPartialNote: Identifiable, Sendable {
     internal let text: String
 
     internal var id: String { selection.id }
+}
+
+/// Counts the rows of a table that point at nothing through one foreign key.
+internal struct ObjectCopyKeyCheck: Sendable, Equatable {
+    internal let constraint: String
+    internal let sql: String
 }
 
 /// Whether the copy's foreign keys point only at tables it writes, which is when the target's checks

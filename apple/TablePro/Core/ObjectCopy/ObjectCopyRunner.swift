@@ -276,7 +276,7 @@ internal struct ObjectCopyRunner {
             do {
                 result = try await Self.withForeignKeysRelaxed(
                     on: plugin, when: relaxesKeys && !usesTransaction && owner != .session
-                ) {
+                ) { _ in
                     try await Self.executeTableDDL(
                         schemaStatements: schemaStatements,
                         groups: tableGroups,
@@ -426,9 +426,9 @@ internal struct ObjectCopyRunner {
     nonisolated private static func withForeignKeysRelaxed<T>(
         on plugin: any PluginDatabaseDriver,
         when relaxes: Bool,
-        _ body: () async throws -> T
+        _ body: (_ relaxed: Bool) async throws -> T
     ) async throws -> T {
-        guard relaxes else { return try await body() }
+        guard relaxes else { return try await body(false) }
         let opened: PluginSessionScope?
         do {
             opened = try await plugin.openSessionScope(for: .relaxedForeignKeys)
@@ -436,7 +436,7 @@ internal struct ObjectCopyRunner {
             logger.warning("Copying with foreign key checks on: \(error.publicLogShape, privacy: .public)")
             opened = nil
         }
-        guard let scope = opened else { return try await body() }
+        guard let scope = opened else { return try await body(false) }
         // Shielded like a rollback: the connection goes back to the pool after this lease.
         func close() async {
             do {
@@ -446,7 +446,7 @@ internal struct ObjectCopyRunner {
             }
         }
         do {
-            let value = try await body()
+            let value = try await body(true)
             await close()
             return value
         } catch {
@@ -607,7 +607,7 @@ internal struct ObjectCopyRunner {
             result.stopped = cleared.stopped
 
             if !result.stopped {
-                try await Self.withForeignKeysRelaxed(on: targetPlugin, when: usesTransaction && relaxesRows) {
+                try await Self.withForeignKeysRelaxed(on: targetPlugin, when: usesTransaction && relaxesRows) { relaxed in
                     let copied = await Self.stream(
                         steps,
                         from: sourceScope,
@@ -622,6 +622,11 @@ internal struct ObjectCopyRunner {
                     result.cancelled = result.cancelled || copied.cancelled
                     result.stopped = copied.stopped
                     result.rowsCopied = copied.rowsCopied
+                    // A row read while the source was changing, or one the source already broke,
+                    // fails here rather than committing past keys nothing checks again.
+                    if relaxed, !result.stopped {
+                        await Self.checkKeys(of: steps, on: targetPlugin, into: &result, progress: progress)
+                    }
                 }
             }
 
@@ -769,21 +774,55 @@ internal struct ObjectCopyRunner {
         /// The injected manager on both sides. Reaching for the singleton on the target bypassed
         /// the caller's own connections and routing, which is the whole point of injecting one.
         let manager = self.manager
-        return try await manager.withMetadataDriver(scope: sourceScope, workload: .bulk) { sourceDriver in
-            guard let sourcePlugin = CompareMetadataService.pluginDriver(from: sourceDriver) else {
-                throw ObjectCopyError.refused(Self.noSourceDriver)
+        // Target first, as `runInOneTransaction` takes them: two copies taking the two leases in
+        // opposite orders could each hold the one the other waits for.
+        return try await manager.withMetadataDriver(scope: targetScope, workload: .bulk) { targetDriver in
+            guard let targetPlugin = CompareMetadataService.pluginDriver(from: targetDriver) else {
+                throw ObjectCopyError.refused(Self.noTargetDriver)
             }
+            let owner = await Self.transactionOwner(of: targetDriver)
             return try await manager.withMetadataDriver(
-                scope: targetScope, workload: .bulk
-            ) { targetDriver in
-                guard let targetPlugin = CompareMetadataService.pluginDriver(from: targetDriver) else {
-                    throw ObjectCopyError.refused(Self.noTargetDriver)
+                scope: sourceScope, workload: .bulk
+            ) { sourceDriver in
+                guard let sourcePlugin = CompareMetadataService.pluginDriver(from: sourceDriver) else {
+                    throw ObjectCopyError.refused(Self.noSourceDriver)
                 }
-                let owner = await Self.transactionOwner(of: targetDriver)
                 let outcome = try await copier.copy(from: sourcePlugin, to: targetPlugin) { rows in
                     progress.setRowsForCurrentObject(rows, completedBefore: completedBefore)
                 }
                 return CopiedRows(outcome: outcome, joinedSessionTransaction: owner == .session)
+            }
+        }
+    }
+
+    /// Stops at the first key that fails, since the rollback that follows takes back every table.
+    nonisolated private static func checkKeys(
+        of steps: [ObjectCopyTableStep],
+        on driver: any PluginDatabaseDriver,
+        into result: inout DataResult,
+        progress: ObjectCopyProgress
+    ) async {
+        for step in steps {
+            for check in step.keyChecks ?? [] {
+                if progress.isCancelled || Task.isCancelled {
+                    result.cancelled = true
+                    result.stopped = true
+                    return
+                }
+                let failure: String
+                do {
+                    let counted = try await driver.execute(query: check.sql).rows.first?.first?.asText
+                    guard let broken = counted.flatMap(Int.init), broken > 0 else { continue }
+                    failure = String(
+                        format: String(localized: "Rows in %1$@ break the foreign key %2$@."),
+                        step.qualifiedTargetName, check.constraint
+                    )
+                } catch {
+                    failure = error.localizedDescription
+                }
+                result.outcomes.append(ObjectCopyObjectOutcome(selection: step.selection, rowsCopied: 0, error: failure))
+                result.stopped = true
+                return
             }
         }
     }

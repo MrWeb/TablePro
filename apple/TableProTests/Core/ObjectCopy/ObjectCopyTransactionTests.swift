@@ -37,6 +37,8 @@ private final class RecordingCopyDriver: PluginDriverStub, @unchecked Sendable {
     private let cancelsOnInsert: Bool
     private let rowCount: Int
     private let transactional: Bool
+    private let brokenRows: Int
+    private let throwsCancellationAfter: Int?
     private var inserts = 0
 
     init(
@@ -48,7 +50,9 @@ private final class RecordingCopyDriver: PluginDriverStub, @unchecked Sendable {
         failsInsertsAfter: Int? = nil,
         cancelsOnInsert: Bool = false,
         rowCount: Int = 1,
-        transactional: Bool = true
+        transactional: Bool = true,
+        brokenRows: Int = 0,
+        throwsCancellationAfter: Int? = nil
     ) {
         self.name = name
         self.log = log
@@ -59,6 +63,8 @@ private final class RecordingCopyDriver: PluginDriverStub, @unchecked Sendable {
         self.cancelsOnInsert = cancelsOnInsert
         self.rowCount = rowCount
         self.transactional = transactional
+        self.brokenRows = brokenRows
+        self.throwsCancellationAfter = throwsCancellationAfter
     }
 
     var capabilities: PluginCapabilities { [] }
@@ -84,6 +90,11 @@ private final class RecordingCopyDriver: PluginDriverStub, @unchecked Sendable {
     func execute(query: String) async throws -> PluginQueryResult {
         record(query)
         if failing.contains(query) { throw StatementFailure() }
+        if query.hasPrefix("SELECT COUNT(*)") {
+            return PluginQueryResult(
+                columns: ["count"], columnTypeNames: [], rows: [[.text("\(brokenRows)")]], rowsAffected: 0, executionTime: 0
+            )
+        }
         return PluginQueryResult(
             columns: ["id"],
             columnTypeNames: [],
@@ -102,6 +113,7 @@ private final class RecordingCopyDriver: PluginDriverStub, @unchecked Sendable {
             }
         }
         inserts += 1
+        if inserts > throwsCancellationAfter ?? .max { throw CancellationError() }
         if failsInserts || inserts > failsInsertsAfter ?? .max { throw StatementFailure() }
         return PluginQueryResult(columns: [], columnTypeNames: [], rows: [], rowsAffected: 1, executionTime: 0)
     }
@@ -114,9 +126,11 @@ private final class RecordingCopyDriver: PluginDriverStub, @unchecked Sendable {
 @MainActor
 private final class StubMetadataProvider: ScopedMetadataProviding {
     private let drivers: [UUID: DatabaseDriver]
+    private let leases: CopyEventLog?
 
-    init(drivers: [UUID: DatabaseDriver]) {
+    init(leases: CopyEventLog? = nil, drivers: [UUID: DatabaseDriver]) {
         self.drivers = drivers
+        self.leases = leases
     }
 
     func withMetadataDriver<T: Sendable>(
@@ -127,6 +141,7 @@ private final class StubMetadataProvider: ScopedMetadataProviding {
         guard let driver = drivers[scope.connectionId] else {
             throw ObjectCopyError.refused("No driver for \(scope.connectionId)")
         }
+        leases?.record("lease \(scope.database)")
         return try await body(driver)
     }
 
@@ -168,7 +183,9 @@ struct ObjectCopyTransactionTests {
         )
     }
 
-    private func dataStep(_ table: String, clears: Bool = false) -> ObjectCopyTableStep {
+    private func dataStep(
+        _ table: String, clears: Bool = false, keyChecks: [ObjectCopyKeyCheck] = []
+    ) -> ObjectCopyTableStep {
         ObjectCopyTableStep(
             selection: ObjectCopySelection(kind: .table, name: table, schema: nil),
             dropStatements: [],
@@ -185,7 +202,8 @@ struct ObjectCopyTransactionTests {
             estimatedRows: nil,
             copiesData: true,
             copiesIdentityColumn: false,
-            note: nil
+            note: nil,
+            keyChecks: keyChecks
         )
     }
 
@@ -236,9 +254,10 @@ struct ObjectCopyTransactionTests {
     private func run(
         _ plan: ObjectCopyPlan,
         source: RecordingCopyDriver,
-        target: RecordingCopyDriver
+        target: RecordingCopyDriver,
+        leases: CopyEventLog? = nil
     ) async throws -> ObjectCopyRunResult {
-        let provider = StubMetadataProvider(drivers: [
+        let provider = StubMetadataProvider(leases: leases, drivers: [
             sourceScope.connectionId: PluginDriverAdapter(
                 connection: TestFixtures.makeConnection(type: sourceType), pluginDriver: source
             ),
@@ -497,6 +516,78 @@ struct ObjectCopyTransactionTests {
         #expect(failed.rowsCopied == SQLWriteBatchBudget.maximumRows)
         #expect(!log.events.contains("target begin"))
         #expect(!log.events.contains("target open relaxedForeignKeys"))
+    }
+
+    @Test("A relaxed copy checks every key it wrote before it commits")
+    func relaxedCopyChecksKeysBeforeCommit() async throws {
+        let log = CopyEventLog()
+        let check = ObjectCopyKeyCheck(constraint: "fk_estate", sql: "SELECT COUNT(*) FROM buildings")
+
+        let result = try await run(
+            dataPlan([dataStep("buildings", keyChecks: [check])]),
+            source: RecordingCopyDriver("source", log: log),
+            target: RecordingCopyDriver("target", log: log)
+        )
+
+        #expect(result.rowsCopied == 1)
+        #expect(log.events == [
+            "target begin",
+            "target open relaxedForeignKeys",
+            "source SELECT id FROM buildings",
+            "target insert",
+            "target SELECT COUNT(*) FROM buildings",
+            "target close relaxedForeignKeys",
+            "target commit",
+        ])
+    }
+
+    /// A child read after its parent while the source was changing, or one the source already broke.
+    @Test("A row a key refuses fails the copy and takes every table back")
+    func brokenKeyRollsTheCopyBack() async throws {
+        let log = CopyEventLog()
+        let check = ObjectCopyKeyCheck(constraint: "fk_estate", sql: "SELECT COUNT(*) FROM buildings")
+
+        let result = try await run(
+            dataPlan([dataStep("estates"), dataStep("buildings", keyChecks: [check])]),
+            source: RecordingCopyDriver("source", log: log),
+            target: RecordingCopyDriver("target", log: log, brokenRows: 2)
+        )
+
+        #expect(result.rowsCopied == 0)
+        #expect(result.failures.map { $0.outcome.selection.name } == ["buildings"])
+        #expect(log.events.suffix(2) == ["target close relaxedForeignKeys", "target rollback"])
+    }
+
+    @Test(
+        "Both paths lease the target before the source",
+        arguments: [ImportErrorHandling.stopAndRollback, .stopAndCommit]
+    )
+    func leasesTheTargetFirst(errorHandling: ImportErrorHandling) async throws {
+        let log = CopyEventLog()
+        let leases = CopyEventLog()
+
+        _ = try await run(
+            dataPlan([dataStep("buildings")], errorHandling: errorHandling),
+            source: RecordingCopyDriver("source", log: log),
+            target: RecordingCopyDriver("target", log: log),
+            leases: leases
+        )
+
+        #expect(leases.events == ["lease staging", "lease app"])
+    }
+
+    @Test("A driver that throws a cancellation keeps the count of the batches before it")
+    func thrownCancellationKeepsTheCount() async throws {
+        let log = CopyEventLog()
+
+        let result = try await run(
+            dataPlan([dataStep("buildings")], errorHandling: .stopAndCommit),
+            source: RecordingCopyDriver("source", log: log, rowCount: SQLWriteBatchBudget.maximumRows + 1),
+            target: RecordingCopyDriver("target", log: log, throwsCancellationAfter: 1)
+        )
+
+        #expect(result.cancelled)
+        #expect(result.rowsCopied == SQLWriteBatchBudget.maximumRows)
     }
 
     /// Relaxed, a DELETE would leave rows in a table outside the copy pointing at nothing.

@@ -122,7 +122,9 @@ internal struct ObjectCopyRowCopier: Sendable {
                 onProgress(inserted)
             }
             return Outcome(inserted: inserted, cancelled: Task.isCancelled)
-        } catch where inserted > 0 && !(error is CancellationError) {
+        } catch is CancellationError {
+            return Outcome(inserted: inserted, cancelled: true)
+        } catch where inserted > 0 {
             throw PartialFailure(written: inserted, underlying: error)
         }
     }

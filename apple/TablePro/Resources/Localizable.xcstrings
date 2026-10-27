@@ -152434,6 +152434,9 @@
         }
       }
     },
+    "Rows in %1$@ break the foreign key %2$@." : {
+
+    },
     "Rows in %@ changed after they were compared. Compare again before generating the script." : {
       "localizations" : {
         "fr" : {

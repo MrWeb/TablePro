@@ -488,4 +488,51 @@ struct ObjectCopyPlannerOrderingTests {
         #expect(whole == ObjectCopyKeysInside(created: true, rows: true))
         #expect(alone == ObjectCopyKeysInside(created: false, rows: false))
     }
+
+    // MARK: - Key checks
+
+    private func key(
+        _ name: String, _ columns: [String], references table: String, _ referenced: [String]
+    ) -> EditableForeignKeyDefinition {
+        EditableForeignKeyDefinition(
+            id: UUID(), name: name, columns: columns, referencedTable: table, referencedColumns: referenced,
+            referencedSchema: nil, onDelete: .noAction, onUpdate: .noAction
+        )
+    }
+
+    private func keyChecks(_ keys: [EditableForeignKeyDefinition]) -> [ObjectCopyKeyCheck]? {
+        ObjectCopyPlanner.keyChecks(
+            for: TableStructureSnapshot(name: "lines", columns: [], foreignKeys: keys),
+            schema: nil,
+            driver: QuotingDriver(),
+            databaseType: .sqlite
+        )
+    }
+
+    @Test
+    func aCompositeKeyIsCheckedOnEveryColumnAndSkipsNulls() {
+        let checks = keyChecks([key("fk_order", ["order_id", "shop_id"], references: "orders", ["id", "shop_id"])])
+
+        #expect(checks == [ObjectCopyKeyCheck(
+            constraint: "fk_order",
+            sql: #"SELECT COUNT(*) FROM "lines" c WHERE c."order_id" IS NOT NULL AND c."shop_id" IS NOT NULL "#
+                + #"AND NOT EXISTS (SELECT 1 FROM "orders" p WHERE p."id" = c."order_id" AND p."shop_id" = c."shop_id")"#
+        )])
+    }
+
+    @Test
+    func aSelfReferenceIsCheckedAgainstItsOwnTable() {
+        let checks = keyChecks([key("fk_parent", ["parent_id"], references: "lines", ["id"])])
+
+        #expect(checks?.first?.sql.contains(#"FROM "lines" c"#) == true)
+        #expect(checks?.first?.sql.contains(#"FROM "lines" p"#) == true)
+    }
+
+    @Test
+    func aKeyWhoseColumnsDoNotPairCannotBeChecked() {
+        #expect(keyChecks([key("fk_bad", ["a", "b"], references: "orders", ["id"])]) == nil)
+        #expect(keyChecks([]) == [])
+    }
 }
+
+private final class QuotingDriver: PluginDriverStub, @unchecked Sendable {}

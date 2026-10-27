@@ -235,6 +235,7 @@ internal struct ObjectCopyTableDDL: Sendable {
     var drop: [SyncStatement] = []
     var create: [SyncStatement] = []
     var truncate: [SyncStatement] = []
+    var keyChecks: [ObjectCopyKeyCheck]?
 }
 
 internal enum ObjectCopyError: LocalizedError {

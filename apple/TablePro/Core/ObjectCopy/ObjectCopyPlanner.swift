@@ -109,7 +109,7 @@ internal struct ObjectCopyPlanner {
         }
         let parentsFirst = Self.orderAcrossScopes(&passes)
         let drafts = passes.flatMap(\.drafts)
-        let keysInside = Self.keysInside(
+        var keysInside = Self.keysInside(
             passes.map { (namespace: $0.sourceNamespace, tables: $0.drafts.map(\.selection)) },
             reads: Dictionary(drafts.map { ($0.selection, $0.read) }, uniquingKeysWith: { first, _ in first }),
             created: Set(drafts.filter(\.writesStructure).map(\.selection)),
@@ -160,6 +160,7 @@ internal struct ObjectCopyPlanner {
             )
         }
         tableSteps.sort { parentsFirst($0.selection, $1.selection) }
+        keysInside.rows = keysInside.rows && tableSteps.filter(\.copiesData).allSatisfy { $0.keyChecks != nil }
 
         return ObjectCopyPlan(
             request: request,
@@ -542,7 +543,8 @@ internal struct ObjectCopyPlanner {
                 coercer: draft.coercer,
                 serverSideInsert: draft.copiesData ? serverSide[draft.selection.id] : nil,
                 hasRowFilter: VerbatimTransferScopes.filtersRows(draft.rowScope),
-                note: draft.note
+                note: draft.note,
+                keyChecks: statements.keyChecks
             )
         }
     }
@@ -781,6 +783,9 @@ internal struct ObjectCopyPlanner {
                     ddl.create = try builder.build(
                         operations: [.createTable(input.snapshot)], foreignKeysByTable: [:]
                     )
+                    ddl.keyChecks = Self.keyChecks(
+                        for: input.snapshot, schema: input.targetSchema, driver: plugin, databaseType: driver.connection.type
+                    )
                 }
                 if input.emptiesFirst {
                     ddl.truncate = Self.emptyStatements(
@@ -862,6 +867,36 @@ internal struct ObjectCopyPlanner {
             charset: snapshot.charset,
             collation: snapshot.collation
         )
+    }
+
+    /// Turning the target's checks back on checks nothing already written, so a copy that wrote
+    /// with them off counts what each key would have refused before it commits. Nil when a key's
+    /// columns do not pair up, since that one could not be checked.
+    nonisolated static func keyChecks(
+        for snapshot: TableStructureSnapshot,
+        schema: String?,
+        driver: any PluginDatabaseDriver,
+        databaseType: DatabaseType
+    ) -> [ObjectCopyKeyCheck]? {
+        let quote = driver.quoteIdentifier
+        let child = SchemaQualifiedName.render(name: snapshot.name, schema: schema, databaseType: databaseType, quote: quote)
+        var checks: [ObjectCopyKeyCheck] = []
+        for key in snapshot.foreignKeys {
+            guard !key.columns.isEmpty, key.columns.count == key.referencedColumns.count else { return nil }
+            let parent = SchemaQualifiedName.render(
+                name: key.referencedTable, schema: key.referencedSchema ?? schema, databaseType: databaseType, quote: quote
+            )
+            // A key with any column NULL holds nothing, the way MATCH SIMPLE reads it.
+            let present = key.columns.map { "c.\(quote($0)) IS NOT NULL" }.joined(separator: " AND ")
+            let matches = zip(key.columns, key.referencedColumns)
+                .map { "p.\(quote($1)) = c.\(quote($0))" }
+                .joined(separator: " AND ")
+            checks.append(ObjectCopyKeyCheck(
+                constraint: key.name,
+                sql: "SELECT COUNT(*) FROM \(child) c WHERE \(present) AND NOT EXISTS (SELECT 1 FROM \(parent) p WHERE \(matches))"
+            ))
+        }
+        return checks
     }
 
     /// What empties a table before its rows are written.
