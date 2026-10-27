@@ -48,6 +48,15 @@ struct ObjectCopyPlannerOrderingTests {
         )
     }
 
+    private func parentsFirst(
+        _ selections: [ObjectCopySelection],
+        reads: [ObjectCopySelection: TableStructureRead]
+    ) -> [ObjectCopySelection] {
+        ObjectCopyPlanner.orderedByDependency(
+            [(namespace: "public", tables: selections)], reads: reads, slot: .schema
+        )
+    }
+
     @Test
     func aParentIsCreatedBeforeItsChild() {
         let orders = selection("orders")
@@ -57,9 +66,7 @@ struct ObjectCopyPlannerOrderingTests {
             customers: read("customers")
         ]
 
-        let ordered = ObjectCopyPlanner.orderedByDependency(
-            [orders, customers], reads: reads, effectiveSchema: "public"
-        )
+        let ordered = parentsFirst([orders, customers], reads: reads)
 
         #expect(ordered.map(\.name) == ["customers", "orders"])
     }
@@ -76,12 +83,66 @@ struct ObjectCopyPlannerOrderingTests {
             customers: read("customers")
         ]
 
-        let ordered = ObjectCopyPlanner.orderedByDependency(
-            [orders, customers], reads: reads, effectiveSchema: "public"
-        )
+        let ordered = parentsFirst([orders, customers], reads: reads)
 
         #expect(ordered.map(\.name) == ["customers", "orders"],
             "the edge has to survive the schema the table itself does not report")
+    }
+
+    /// Sorted one scope at a time, a PostgreSQL database copy created `app.orders` before the
+    /// `core.users` it references, because `app` was the first scope.
+    @Test
+    func aParentInAnotherScopeIsCreatedFirst() {
+        let orders = selection("orders", schema: "app")
+        let users = selection("users", schema: "core")
+        let reads: [ObjectCopySelection: TableStructureRead] = [
+            orders: read("orders", referencing: ["users"], referencedSchema: "core"),
+            users: read("users")
+        ]
+
+        let ordered = ObjectCopyPlanner.orderedByDependency(
+            [(namespace: "app", tables: [orders]), (namespace: "core", tables: [users])],
+            reads: reads,
+            slot: .schema
+        )
+
+        #expect(ordered.map(\.qualifiedName) == ["core.users", "app.orders"])
+    }
+
+    /// A MySQL key names its database the way the server spells it. On a server with
+    /// `lower_case_table_names` 1 the endpoint can say `Regest` while the key says `regest`.
+    @Test
+    func aDatabaseSpelledInAnotherCaseIsTheSameDatabase() {
+        let buildings = selection("buildings", schema: nil)
+        let estates = selection("estates", schema: nil)
+        let reads: [ObjectCopySelection: TableStructureRead] = [
+            buildings: read("buildings", referencing: ["estates"], referencedSchema: "regest"),
+            estates: read("estates")
+        ]
+
+        let ordered = ObjectCopyPlanner.orderedByDependency(
+            [(namespace: "Regest", tables: [buildings, estates])], reads: reads, slot: .database
+        )
+
+        #expect(ordered.map(\.name) == ["estates", "buildings"])
+    }
+
+    /// PostgreSQL schemas `App` and `app` are two schemas, so a key into `App` is no edge in `app`.
+    /// Without one the tie-break puts `orders` first.
+    @Test
+    func aSchemaSpelledInAnotherCaseIsAnotherSchema() {
+        let orders = selection("orders", schema: "app")
+        let users = selection("users", schema: "app")
+        let reads: [ObjectCopySelection: TableStructureRead] = [
+            orders: read("orders", referencing: ["users"], referencedSchema: "App"),
+            users: read("users")
+        ]
+
+        let ordered = ObjectCopyPlanner.orderedByDependency(
+            [(namespace: "app", tables: [users, orders])], reads: reads, slot: .schema
+        )
+
+        #expect(ordered.map(\.name) == ["orders", "users"])
     }
 
     /// A cycle cannot be ordered, and dropping one of its tables would be worse than letting the
@@ -95,9 +156,7 @@ struct ObjectCopyPlannerOrderingTests {
             second: read("b", referencing: ["a"])
         ]
 
-        let ordered = ObjectCopyPlanner.orderedByDependency(
-            [first, second], reads: reads, effectiveSchema: "public"
-        )
+        let ordered = parentsFirst([first, second], reads: reads)
 
         #expect(Set(ordered.map(\.name)) == ["a", "b"])
         #expect(ordered.count == 2)
@@ -106,9 +165,7 @@ struct ObjectCopyPlannerOrderingTests {
     @Test
     func aSingleTableIsReturnedUnchanged() {
         let only = selection("orders")
-        #expect(ObjectCopyPlanner.orderedByDependency(
-                [only], reads: [only: read("orders")], effectiveSchema: "public"
-            ).map(\.name) == ["orders"])
+        #expect(parentsFirst([only], reads: [only: read("orders")]).map(\.name) == ["orders"])
     }
 
     @Test
@@ -302,9 +359,7 @@ struct ObjectCopyPlannerOrderingTests {
         let unread = names.map { selection($0) }
         let reads: [ObjectCopySelection: TableStructureRead] = [placed: read("customers")]
 
-        let ordered = ObjectCopyPlanner.orderedByDependency(
-            [placed] + unread, reads: reads, effectiveSchema: "public"
-        )
+        let ordered = parentsFirst([placed] + unread, reads: reads)
 
         #expect(ordered.map(\.name) == ["customers"] + names)
     }
@@ -320,12 +375,8 @@ struct ObjectCopyPlannerOrderingTests {
         var backwards: [ObjectCopySelection: TableStructureRead] = [:]
         for (selection, name) in zip(selections, names).reversed() { backwards[selection] = read(name) }
 
-        let first = ObjectCopyPlanner.orderedByDependency(
-            selections, reads: forwards, effectiveSchema: "public"
-        )
-        let second = ObjectCopyPlanner.orderedByDependency(
-            selections, reads: backwards, effectiveSchema: "public"
-        )
+        let first = parentsFirst(selections, reads: forwards)
+        let second = parentsFirst(selections, reads: backwards)
 
         #expect(first.map(\.name) == second.map(\.name))
         #expect(Set(first.map(\.name)) == Set(names))
@@ -344,9 +395,7 @@ struct ObjectCopyPlannerOrderingTests {
             audit: read("audit")
         ]
 
-        let ordered = ObjectCopyPlanner.orderedByDependency(
-            [orders, audit, customers], reads: reads, effectiveSchema: "public"
-        )
+        let ordered = parentsFirst([orders, audit, customers], reads: reads)
 
         guard let parent = ordered.firstIndex(of: customers),
               let child = ordered.firstIndex(of: orders) else {

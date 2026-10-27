@@ -42,8 +42,8 @@ internal struct ObjectCopyPlanner {
         try refuseUpFront(request)
 
         /// One pass per source namespace. A database-level copy on PostgreSQL spans every schema,
-        /// and each schema's tables have to be read, ordered and written in their own scope: one
-        /// read against a nil schema answers only whatever the connection is currently on.
+        /// and each schema's tables have to be read and written in their own scope: one read
+        /// against a nil schema answers only whatever the connection is currently on.
         var skipped: [ObjectCopySkip] = []
         var tableSteps: [ObjectCopyTableStep] = []
         var definitionSteps: [ObjectCopyDefinitionStep] = []
@@ -99,6 +99,7 @@ internal struct ObjectCopyPlanner {
             passes.append(ScopePass(
                 scope: scope,
                 sourceEndpoint: sourceEndpoint,
+                sourceNamespace: ObjectCopyNamespace.name(for: sourceEndpoint),
                 targetEndpoint: targetEndpoint,
                 sourceReads: sourceReads,
                 targetObjects: targetObjects,
@@ -106,6 +107,9 @@ internal struct ObjectCopyPlanner {
                 skipped: tableSkips
             ))
         }
+        let parentsFirst = Self.orderAcrossScopes(
+            &passes, slot: EngineNamespaceSlot(databaseType: request.source.databaseType)
+        )
 
         /// Every source scope of a copy to a chosen target lands in the one schema that was chosen,
         /// so the names its indexes take are allocated across scopes, not afresh for each.
@@ -144,6 +148,7 @@ internal struct ObjectCopyPlanner {
                 skipped: &skipped
             )
         }
+        tableSteps.sort { parentsFirst($0.selection, $1.selection) }
 
         return ObjectCopyPlan(
             request: request,
@@ -152,8 +157,59 @@ internal struct ObjectCopyPlanner {
             definitionSteps: definitionSteps,
             schemaStatements: try await buildSchemaStatements(request, namespaces: targetNamespaces),
             skipped: skipped,
-            isStructureReadPinned: isStructureReadPinned
+            isStructureReadPinned: isStructureReadPinned,
+            clearsAreSelfContained: try await clearsAreSelfContained(request, tableSteps: tableSteps)
         )
+    }
+
+    /// Settles one dependency order over every scope's tables and puts each pass's drafts in it.
+    ///
+    /// Sorted one scope at a time, a PostgreSQL database with `app.orders` referencing `core.users`
+    /// created `orders` first, because `app` was the first scope. The drafts are reordered before
+    /// any step is built, because a sequence several tables share is created under the first.
+    private static func orderAcrossScopes(
+        _ passes: inout [ScopePass],
+        slot: EngineNamespaceSlot
+    ) -> (ObjectCopySelection, ObjectCopySelection) -> Bool {
+        var reads: [ObjectCopySelection: TableStructureRead] = [:]
+        for draft in passes.flatMap(\.drafts) {
+            reads[draft.selection] = draft.read
+        }
+        let ordered = orderedByDependency(
+            passes.map { (namespace: $0.sourceNamespace, tables: $0.drafts.map(\.selection)) },
+            reads: reads,
+            slot: slot
+        )
+        let rank = Dictionary(
+            ordered.enumerated().map { ($0.element, $0.offset) }, uniquingKeysWith: { first, _ in first }
+        )
+        let parentsFirst = { (lhs: ObjectCopySelection, rhs: ObjectCopySelection) in
+            (rank[lhs] ?? .max) < (rank[rhs] ?? .max)
+        }
+        for index in passes.indices {
+            passes[index].drafts.sort { parentsFirst($0.selection, $1.selection) }
+        }
+        return parentsFirst
+    }
+
+    /// Asked of the target only when the plan empties a table, and in one whole-scope read.
+    private func clearsAreSelfContained(
+        _ request: ObjectCopyRequest,
+        tableSteps: [ObjectCopyTableStep]
+    ) async throws -> Bool {
+        let cleared = tableSteps.filter(\.clearsTarget).map(\.targetTable)
+        guard !cleared.isEmpty else { return false }
+        /// Every clear is in `request.target`: a duplicate creates its tables, so it empties none.
+        let target = request.target
+        let schema = target.schema?.nilIfEmpty
+        let namespace = ObjectCopyNamespace.name(for: target)
+        let slot = EngineNamespaceSlot(databaseType: target.databaseType)
+        return try await manager.withMetadataDriver(scope: targetScope(request, endpoint: target)) { driver in
+            guard let plugin = CompareMetadataService.pluginDriver(from: driver) else { return false }
+            return try await Self.clearsAreSelfContained(
+                clearing: cleared, schema: schema, namespace: namespace, slot: slot, using: plugin
+            )
+        }
     }
 
     private func sourceTableReads(
@@ -231,10 +287,14 @@ internal struct ObjectCopyPlanner {
     private struct ScopePass {
         let scope: Scope
         let sourceEndpoint: DatabaseEndpoint
+        /// The engine's own namespace, not the endpoint's schema. MySQL reports no schema on a
+        /// table while its foreign keys carry the database name, so ordering by the schema alone
+        /// matched no edge and fell through to alphabetical order.
+        let sourceNamespace: String?
         let targetEndpoint: DatabaseEndpoint
         let sourceReads: [TableStructureRead]
         let targetObjects: [String: ObjectCopySelection]
-        let drafts: [ObjectCopyTableDraft]
+        var drafts: [ObjectCopyTableDraft]
         let skipped: [ObjectCopySkip]
     }
 
@@ -412,20 +472,13 @@ internal struct ObjectCopyPlanner {
         }
         guard !reads.isEmpty else { return [] }
 
-        /// The engine's own namespace, not the endpoint's schema. MySQL reports no schema on a
-        /// table while its foreign keys carry the database name, so ordering by the schema alone
-        /// matched no edge and fell through to alphabetical order.
-        let sourceNamespace = ObjectCopyNamespace.name(for: sourceEndpoint)
-        /// Seeded from the user's own order, not from `reads.keys`. Swift seeds Dictionary hashing
-        /// per process, so taking the keys gave the tables with no foreign key between them a
-        /// different tie-break on every launch: the approved script, the progress order and the
-        /// outcome list were all shuffled differently for the same copy.
+        /// In the user's own order, not `reads.keys`: Swift seeds Dictionary hashing per process, so
+        /// the tie-break between unrelated tables changed on every launch and shuffled the approved
+        /// script. `orderAcrossScopes` sorts them once every scope is read.
         var drafts: [ObjectCopyTableDraft] = []
         let targetServerVersion = manager.driver(for: request.target.connectionId)?.serverVersion
-        for selection in Self.orderedByDependency(
-            scope.objects.filter { reads[$0] != nil }, reads: reads, effectiveSchema: sourceNamespace
-        ) {
-            guard let read = reads[selection], let snapshot = read.sourceSnapshot else { continue }
+        for selection in scope.objects {
+            guard let read = reads.removeValue(forKey: selection), let snapshot = read.sourceSnapshot else { continue }
             let targetRead = match(selection, in: targetReads)
             let existsInTarget = targetRead != nil
             if existsInTarget, request.existingPolicy == .skip {
@@ -1047,28 +1100,35 @@ internal struct ObjectCopyPlanner {
     /// Parents before children, so a foreign key in a `CREATE TABLE` finds the table it points at.
     /// A cycle keeps whatever order the sort settles on and fails at the server, which is the same
     /// answer Compare & Sync gives it.
-    /// `effectiveSchema` is the scope the tables were read in, and it is load-bearing.
+    ///
+    /// Every scope goes into one sort, because a key may point into another scope's table. Each
+    /// scope's `namespace` is the one its tables were read in, and it is load-bearing.
     /// `fetchTables` returns `PluginTableInfo.schema == nil` on MySQL and PostgreSQL while their
     /// foreign keys carry a non-nil `referencedSchema`, so nodes built from the table's own schema
     /// were keyed `child` while the dependency named `public.parent`. No edge ever matched, every
     /// table looked independent, and the sort fell through to alphabetical order: a child could be
     /// created before its parent and the server rejected it.
     nonisolated internal static func orderedByDependency(
-        _ selections: [ObjectCopySelection],
+        _ scopes: [(namespace: String?, tables: [ObjectCopySelection])],
         reads: [ObjectCopySelection: TableStructureRead],
-        effectiveSchema: String?
+        slot: EngineNamespaceSlot
     ) -> [ObjectCopySelection] {
+        let selections = scopes.flatMap { $0.tables }
         guard selections.count > 1 else { return selections }
         var foreignKeysByTable: [String: [PluginForeignKeyInfo]] = [:]
         var nodes: [ForeignKeyTopologicalSort.Table] = []
         var bySortKey: [String: ObjectCopySelection] = [:]
-        for selection in selections {
-            guard let read = reads[selection] else { continue }
-            let schema = read.table.schema ?? selection.schema ?? effectiveSchema
-            let node = ForeignKeyTopologicalSort.Table(name: read.table.name, schema: schema)
-            nodes.append(node)
-            foreignKeysByTable[node.identifier] = read.foreignKeys
-            bySortKey[node.identifier] = selection
+        for scope in scopes {
+            for selection in scope.tables {
+                guard let read = reads[selection] else { continue }
+                let schema = read.table.schema ?? selection.schema ?? scope.namespace
+                let node = ForeignKeyTopologicalSort.Table(name: read.table.name, schema: schema)
+                nodes.append(node)
+                foreignKeysByTable[node.identifier] = read.foreignKeys.map {
+                    pointedInto($0, namespace: node.schema, slot: slot)
+                }
+                bySortKey[node.identifier] = selection
+            }
         }
 
         var emitted: Set<String> = []

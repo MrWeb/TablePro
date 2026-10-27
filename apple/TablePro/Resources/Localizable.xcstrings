@@ -84261,6 +84261,10 @@
         }
       }
     },
+    "Foreign key enforcement could not be put back while a transaction is open." : {
+      "extractionState" : "manual",
+      "generatesSymbol" : false
+    },
     "Foreign key must have at least one column, a referenced table, and a referenced column" : {
       "localizations" : {
         "fr" : {

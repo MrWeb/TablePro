@@ -19,6 +19,35 @@ private final class TruncatingEngineDriver: PluginDriverStub, @unchecked Sendabl
     }
 }
 
+private final class TargetForeignKeyDriver: PluginDriverStub, @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private let bulk: Bool
+    private let answer: Result<[String: [PluginForeignKeyInfo]], any Error>
+    private let sessionSchema: String?
+
+    init(
+        bulk: Bool = true,
+        sessionSchema: String? = nil,
+        _ answer: Result<[String: [PluginForeignKeyInfo]], any Error>
+    ) {
+        self.bulk = bulk
+        self.sessionSchema = sessionSchema
+        self.answer = answer
+    }
+
+    var reads: Int { lock.withLock { count } }
+
+    var currentSchema: String? { sessionSchema }
+
+    var providesBulkForeignKeyFetch: Bool { bulk }
+
+    func fetchAllForeignKeys(schema: String?) async throws -> [String: [PluginForeignKeyInfo]] {
+        lock.withLock { count += 1 }
+        return try answer.get()
+    }
+}
+
 struct ObjectCopyPlanTests {
     private func endpoint(
         _ database: String,
@@ -138,6 +167,122 @@ struct ObjectCopyPlanTests {
     @Test
     func aCopyWithNothingToEmptyKeepsItsPerTableTransactions() {
         #expect(!(plan([step("orders", truncates: false)]).clearsInsideDataTransaction))
+    }
+
+    // MARK: - Clears with checks off
+
+    private func key(to table: String, in schema: String? = "shop") -> PluginForeignKeyInfo {
+        PluginForeignKeyInfo(
+            name: "fk_\(table)",
+            column: "\(table)_id",
+            referencedTable: table,
+            referencedColumn: "id",
+            referencedDatabase: nil,
+            referencedSchema: schema
+        )
+    }
+
+    private func selfContained(
+        _ cleared: [String],
+        namespace: String? = "shop",
+        slot: EngineNamespaceSlot = .database,
+        on driver: TargetForeignKeyDriver
+    ) async throws -> Bool {
+        try await ObjectCopyPlanner.clearsAreSelfContained(
+            clearing: cleared, schema: nil, namespace: namespace, slot: slot, using: driver
+        )
+    }
+
+    /// A key between two cleared tables is refilled by the copy, and one out of a cleared table
+    /// points at a parent nothing empties.
+    @Test
+    func clearsThatOnlyReferenceEachOtherAreSelfContained() async throws {
+        let driver = TargetForeignKeyDriver(.success([
+            "buildings": [key(to: "estates")],
+            "estates": [key(to: "users")],
+            "employees": [key(to: "employees")]
+        ]))
+
+        let contained = try await selfContained(["estates", "buildings"], on: driver)
+
+        #expect(contained)
+        #expect(driver.reads == 1)
+    }
+
+    /// Measured on MySQL 8.4: `DELETE FROM estates` with checks off left an unselected `contracts`
+    /// pointing at rows that were gone.
+    @Test
+    func aTableTheCopyLeavesAloneThatReferencesAClearedOneIsNotSelfContained() async throws {
+        let driver = TargetForeignKeyDriver(.success([
+            "buildings": [key(to: "estates")],
+            "contracts": [key(to: "estates")]
+        ]))
+
+        let contained = try await selfContained(["estates", "buildings"], on: driver)
+
+        #expect(!contained)
+    }
+
+    /// The key names the database as the server spells it, which a `lower_case_table_names` 1
+    /// server lets differ from the endpoint's spelling. Missing that match would relax the clears.
+    @Test
+    func aKeyIntoTheSameDatabaseSpelledInAnotherCaseStillCounts() async throws {
+        let driver = TargetForeignKeyDriver(.success(["contracts": [key(to: "estates", in: "shop")]]))
+
+        let contained = try await selfContained(["estates"], namespace: "Shop", on: driver)
+
+        #expect(!contained)
+    }
+
+    /// PostgreSQL reads a nil schema as the session's, and the keys it returns name that schema.
+    @Test
+    func aTargetWithNoSchemaIsMatchedInTheSessionsOwn() async throws {
+        let driver = TargetForeignKeyDriver(
+            sessionSchema: "public", .success(["items": [key(to: "orders", in: "public")]])
+        )
+
+        let contained = try await selfContained(["orders"], namespace: nil, slot: .schema, on: driver)
+
+        #expect(!contained)
+    }
+
+    @Test
+    func aDriverWithoutTheWholeScopeReadIsNeverSelfContained() async throws {
+        let driver = TargetForeignKeyDriver(bulk: false, .success([:]))
+
+        let contained = try await selfContained(["estates"], on: driver)
+
+        #expect(!contained)
+        #expect(driver.reads == 0, "a per-table read of every key in the target is not asked for")
+    }
+
+    @Test
+    func aFailedReadIsNeverSelfContained() async throws {
+        let driver = TargetForeignKeyDriver(.failure(CocoaError(.fileReadNoPermission)))
+
+        let contained = try await selfContained(["estates"], on: driver)
+
+        #expect(!contained)
+    }
+
+    @Test
+    func aCancelledReadCancelsThePlan() async {
+        let driver = TargetForeignKeyDriver(.failure(CancellationError()))
+
+        await #expect(throws: CancellationError.self) {
+            _ = try await self.selfContained(["estates"], on: driver)
+        }
+    }
+
+    @Test
+    func aPlanWithNothingToEmptyIsNotSelfContained() async throws {
+        let driver = TargetForeignKeyDriver(.success([:]))
+
+        let contained = try await selfContained([], on: driver)
+
+        #expect(!contained)
+        #expect(driver.reads == 0)
+        #expect(!plan([step("orders")]).clearsAreSelfContained, "the plan's own default")
     }
 
     /// The script is what the user approves, so it has to be in the order the run uses. Shown

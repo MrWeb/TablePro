@@ -122,11 +122,17 @@ class PostgreSQLPluginDriver: LibPQBackedDriver, @unchecked Sendable {
     // MARK: - Foreign Keys
 
     func foreignKeyDisableStatements() -> [String]? {
-        ["SET session_replication_role = replica"]
+        [Self.settingReplicationRole("replica")]
     }
 
     func foreignKeyEnableStatements() -> [String]? {
-        ["SET session_replication_role = DEFAULT"]
+        [Self.settingReplicationRole("DEFAULT")]
+    }
+
+    /// Setting it takes a superuser or a `SET` grant, and a bare refusal aborts the transaction it runs in. The block
+    /// swallows the refusal and keeps the transaction, and an allowed `SET` outlives it (measured on 17.11 and 18.6).
+    private static func settingReplicationRole(_ value: String) -> String {
+        "DO $$ BEGIN SET session_replication_role = \(value); EXCEPTION WHEN insufficient_privilege THEN NULL; END $$"
     }
 
     /// A duplicated database arrives with `public` alone, so every other schema its tables are

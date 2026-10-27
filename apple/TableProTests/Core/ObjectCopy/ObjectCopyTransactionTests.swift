@@ -14,12 +14,94 @@ import Foundation
 import TableProPluginKit
 import Testing
 
+private struct StatementFailure: Error {}
+
+private final class CopyEventLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [String] = []
+
+    var events: [String] { lock.withLock { entries } }
+
+    func record(_ event: String) {
+        lock.withLock { entries.append(event) }
+    }
+}
+
+private final class RecordingCopyDriver: PluginDriverStub, @unchecked Sendable {
+    private let name: String
+    private let log: CopyEventLog
+    private let sessionState: PluginSessionTransactionState
+    private let failing: Set<String>
+    private let failsInserts: Bool
+    private let cancelsOnInsert: Bool
+
+    init(
+        _ name: String,
+        log: CopyEventLog,
+        sessionState: PluginSessionTransactionState = .idle,
+        failing: Set<String> = [],
+        failsInserts: Bool = false,
+        cancelsOnInsert: Bool = false
+    ) {
+        self.name = name
+        self.log = log
+        self.sessionState = sessionState
+        self.failing = failing
+        self.failsInserts = failsInserts
+        self.cancelsOnInsert = cancelsOnInsert
+    }
+
+    var capabilities: PluginCapabilities { [] }
+    var supportsTransactions: Bool { true }
+    var supportsTransactionalDDL: Bool { true }
+
+    private func record(_ event: String) {
+        log.record("\(name) \(event)")
+    }
+
+    func sessionTransactionState() async -> PluginSessionTransactionState { sessionState }
+
+    func openSessionScope(for purpose: PluginSessionPurpose) async throws -> PluginSessionScope? {
+        record("open \(purpose)")
+        guard purpose == .relaxedForeignKeys else { return nil }
+        return PluginSessionScope(purpose: purpose, saved: [], applied: [])
+    }
+
+    func closeSessionScope(_ scope: PluginSessionScope) async throws {
+        record(Task.isCancelled ? "close \(scope.purpose) while cancelled" : "close \(scope.purpose)")
+    }
+
+    func execute(query: String) async throws -> PluginQueryResult {
+        record(query)
+        if failing.contains(query) { throw StatementFailure() }
+        return PluginQueryResult(
+            columns: ["id"], columnTypeNames: [], rows: [[.text("1")]], rowsAffected: 1, executionTime: 0
+        )
+    }
+
+    func executeParameterized(query: String, parameters: [PluginCellValue]) async throws -> PluginQueryResult {
+        record("insert")
+        if cancelsOnInsert {
+            withUnsafeCurrentTask { task in
+                guard let task else { return }
+                task.cancel()
+            }
+        }
+        if failsInserts { throw StatementFailure() }
+        return PluginQueryResult(columns: [], columnTypeNames: [], rows: [], rowsAffected: 1, executionTime: 0)
+    }
+
+    func beginTransaction() async throws { record("begin") }
+    func commitTransaction() async throws { record("commit") }
+    func rollbackTransaction() async throws { record("rollback") }
+}
+
 @MainActor
 private final class StubMetadataProvider: ScopedMetadataProviding {
-    private let driver: DatabaseDriver
+    private let drivers: [UUID: DatabaseDriver]
 
-    init(driver: DatabaseDriver) {
-        self.driver = driver
+    init(drivers: [UUID: DatabaseDriver]) {
+        self.drivers = drivers
     }
 
     func withMetadataDriver<T: Sendable>(
@@ -27,61 +109,88 @@ private final class StubMetadataProvider: ScopedMetadataProviding {
         workload: MetadataConnectionPool.Workload,
         _ body: @Sendable @escaping (DatabaseDriver) async throws -> T
     ) async throws -> T {
-        try await body(driver)
+        guard let driver = drivers[scope.connectionId] else {
+            throw ObjectCopyError.refused("No driver for \(scope.connectionId)")
+        }
+        return try await body(driver)
     }
 
     func browseScope(for connectionId: UUID) -> DatabaseScope? { nil }
 }
 
-private final class RecordingCopyDriver: PluginDriverStub, @unchecked Sendable {
-    private let lock = NSLock()
-    private var statements: [String] = []
-    private var transactions: [String] = []
-    private var state: PluginSessionTransactionState
-    private let relaxesForeignKeys: Bool
-
-    init(sessionState: PluginSessionTransactionState, relaxesForeignKeys: Bool = false) {
-        state = sessionState
-        self.relaxesForeignKeys = relaxesForeignKeys
-    }
-
-    func foreignKeyDisableStatements() -> [String]? { relaxesForeignKeys ? ["FK OFF"] : nil }
-    func foreignKeyEnableStatements() -> [String]? { relaxesForeignKeys ? ["FK ON"] : nil }
-
-    var executed: [String] { lock.withLock { statements } }
-    var transactionEvents: [String] { lock.withLock { transactions } }
-
-    var capabilities: PluginCapabilities { [] }
-    var supportsTransactions: Bool { true }
-    var supportsTransactionalDDL: Bool { true }
-
-    func sessionTransactionState() async -> PluginSessionTransactionState { lock.withLock { state } }
-
-    func execute(query: String) async throws -> PluginQueryResult {
-        lock.withLock { statements.append(query) }
-        return PluginQueryResult(columns: [], columnTypeNames: [], rows: [], rowsAffected: 0, executionTime: 0)
-    }
-
-    func beginTransaction() async throws { lock.withLock { transactions.append("begin") } }
-    func commitTransaction() async throws { lock.withLock { transactions.append("commit") } }
-    func rollbackTransaction() async throws { lock.withLock { transactions.append("rollback") } }
-}
-
 @MainActor
 struct ObjectCopyTransactionTests {
-    private func endpoint(_ database: String) -> DatabaseEndpoint {
+    private let sourceScope = DatabaseScope(connectionId: UUID(), database: "app", schema: nil)
+    private let targetScope = DatabaseScope(connectionId: UUID(), database: "staging", schema: nil)
+
+    // Different engines, so the copier opens no scope of its own and the log holds only the runner's.
+    private let sourceType = DatabaseType.postgresql
+    private let targetType = DatabaseType.mysql
+
+    private func endpoint(_ scope: DatabaseScope, _ type: DatabaseType) -> DatabaseEndpoint {
         DatabaseEndpoint(
-            scope: DatabaseScope(connectionId: UUID(), database: database, schema: nil),
-            connectionName: "server",
-            databaseType: .duckdb,
+            scope: scope,
+            connectionName: scope.database,
+            databaseType: type,
             safeModeLevel: .silent,
             color: .blue
         )
     }
 
+    private func request(
+        _ selections: [ObjectCopySelection],
+        content: ObjectCopyContent,
+        errorHandling: ImportErrorHandling = .stopAndRollback
+    ) -> ObjectCopyRequest {
+        ObjectCopyRequest(
+            source: endpoint(sourceScope, sourceType),
+            destination: .existing(endpoint(targetScope, targetType)),
+            objects: selections,
+            content: content,
+            existingPolicy: .replace,
+            errorHandling: errorHandling,
+            wrapEachTableInTransaction: true
+        )
+    }
+
+    private func dataStep(_ table: String, clears: Bool = false) -> ObjectCopyTableStep {
+        ObjectCopyTableStep(
+            selection: ObjectCopySelection(kind: .table, name: table, schema: nil),
+            dropStatements: [],
+            sequenceStatements: [],
+            createStatements: [],
+            truncateStatements: clears
+                ? [SyncStatement(sql: "DELETE FROM \(table)", objectName: table, summary: "clear")]
+                : [],
+            columns: ["id"],
+            primaryKeyColumns: ["id"],
+            sourceQuery: "SELECT id FROM \(table)",
+            targetTable: table,
+            targetSchema: nil,
+            estimatedRows: nil,
+            copiesData: true,
+            copiesIdentityColumn: false,
+            note: nil
+        )
+    }
+
+    private func dataPlan(
+        _ steps: [ObjectCopyTableStep],
+        errorHandling: ImportErrorHandling = .stopAndRollback,
+        clearsAreSelfContained: Bool = false
+    ) -> ObjectCopyPlan {
+        ObjectCopyPlan(
+            request: request(steps.map(\.selection), content: .data, errorHandling: errorHandling),
+            createsDatabase: false,
+            tableSteps: steps,
+            definitionSteps: [],
+            clearsAreSelfContained: clearsAreSelfContained
+        )
+    }
+
     /// A replacement: the drop and the create are one unit, which is what makes the structure phase
     /// want a transaction of its own.
-    private func replacementPlan() -> ObjectCopyPlan {
+    private func replacementPlan(errorHandling: ImportErrorHandling = .stopAndRollback) -> ObjectCopyPlan {
         let selection = ObjectCopySelection(kind: .table, name: "orders", schema: nil)
         let step = ObjectCopyTableStep(
             selection: selection,
@@ -93,7 +202,7 @@ struct ObjectCopyTransactionTests {
             truncateStatements: [],
             columns: [],
             primaryKeyColumns: ["id"],
-            sourceQuery: "SELECT \"id\" FROM \"orders\"",
+            sourceQuery: "SELECT id FROM orders",
             targetTable: "orders",
             targetSchema: nil,
             estimatedRows: nil,
@@ -101,50 +210,57 @@ struct ObjectCopyTransactionTests {
             copiesIdentityColumn: false,
             note: nil
         )
-        let request = ObjectCopyRequest(
-            source: endpoint("app"),
-            destination: .existing(endpoint("staging")),
-            objects: [selection],
-            content: .structure,
-            existingPolicy: .replace,
-            errorHandling: .stopAndRollback,
-            wrapEachTableInTransaction: true
-        )
         return ObjectCopyPlan(
-            request: request,
+            request: request([selection], content: .structure, errorHandling: errorHandling),
             createsDatabase: false,
             tableSteps: [step],
-            definitionSteps: [],
-            schemaStatements: []
+            definitionSteps: []
         )
     }
 
-    private func run(sessionState: PluginSessionTransactionState) async throws -> (ObjectCopyRunResult, RecordingCopyDriver) {
-        let plugin = RecordingCopyDriver(sessionState: sessionState)
-        let connection = TestFixtures.makeConnection(type: .duckdb)
-        let adapter = PluginDriverAdapter(connection: connection, pluginDriver: plugin)
-        let runner = ObjectCopyRunner(manager: StubMetadataProvider(driver: adapter), gate: AlwaysAllowGate())
-        let result = try await runner.run(replacementPlan(), progress: ObjectCopyProgress(progress: Progress()))
-        return (result, plugin)
+    private func run(
+        _ plan: ObjectCopyPlan,
+        source: RecordingCopyDriver,
+        target: RecordingCopyDriver
+    ) async throws -> ObjectCopyRunResult {
+        let provider = StubMetadataProvider(drivers: [
+            sourceScope.connectionId: PluginDriverAdapter(
+                connection: TestFixtures.makeConnection(type: sourceType), pluginDriver: source
+            ),
+            targetScope.connectionId: PluginDriverAdapter(
+                connection: TestFixtures.makeConnection(type: targetType), pluginDriver: target
+            ),
+        ])
+        let runner = ObjectCopyRunner(manager: provider, gate: AlwaysAllowGate())
+        return try await runner.run(plan, progress: ObjectCopyProgress(progress: Progress()))
     }
+
+    // MARK: - Structure
 
     @Test("An idle session lets the copy open its own transaction")
     func idleSessionKeepsTheCopysOwnTransaction() async throws {
-        let (result, driver) = try await run(sessionState: .idle)
+        let log = CopyEventLog()
 
-        #expect(driver.transactionEvents == ["begin", "commit"])
-        #expect(driver.executed == ["DROP TABLE orders;", "CREATE TABLE orders (id INTEGER);"])
+        let result = try await run(
+            replacementPlan(), source: RecordingCopyDriver("source", log: log), target: RecordingCopyDriver("target", log: log)
+        )
+
+        #expect(log.events == [
+            "target begin", "target DROP TABLE orders;", "target CREATE TABLE orders (id INTEGER);", "target commit",
+        ])
         #expect(result.pendingInSessionTransaction == false)
     }
 
     /// The statements still run: they join the transaction the user opened, and only the user can
     /// end it. Opening one over it is what aborted it on DuckDB.
-    @Test("A session holding a transaction is joined rather than wrapped")
+    @Test("A session holding a transaction is joined rather than wrapped, with its keys as they are")
     func openSessionTransactionIsJoined() async throws {
-        let (result, driver) = try await run(sessionState: .inTransaction)
+        let log = CopyEventLog()
+        let target = RecordingCopyDriver("target", log: log, sessionState: .inTransaction)
 
-        #expect(driver.transactionEvents.isEmpty)
-        #expect(driver.executed == ["DROP TABLE orders;", "CREATE TABLE orders (id INTEGER);"])
+        let result = try await run(replacementPlan(), source: RecordingCopyDriver("source", log: log), target: target)
+
+        #expect(log.events == ["target DROP TABLE orders;", "target CREATE TABLE orders (id INTEGER);"])
         #expect(result.pendingInSessionTransaction)
     }
 
@@ -152,58 +268,184 @@ struct ObjectCopyTransactionTests {
     /// so the copy sends none.
     @Test("A session holding locks is joined too")
     func sessionLocksAreJoined() async throws {
-        let (result, driver) = try await run(sessionState: .holdsSessionLocks)
+        let log = CopyEventLog()
+        let target = RecordingCopyDriver("target", log: log, sessionState: .holdsSessionLocks)
 
-        #expect(driver.transactionEvents.isEmpty)
+        let result = try await run(replacementPlan(), source: RecordingCopyDriver("source", log: log), target: target)
+
+        #expect(!log.events.contains("target begin"))
         #expect(result.pendingInSessionTransaction)
     }
 
-    /// Tables arrive in name order, so a child can be written before its parent. The checks have to
-    /// be off on the connection that writes the rows, and back on before it returns to the pool.
-    @Test("The data phase writes rows with foreign key checks off and restores them")
-    func dataPhaseRelaxesForeignKeys() async throws {
-        let selection = ObjectCopySelection(kind: .table, name: "buildings", schema: nil)
-        let step = ObjectCopyTableStep(
-            selection: selection,
-            dropStatements: [],
-            sequenceStatements: [],
-            createStatements: [],
-            truncateStatements: [],
-            columns: [],
-            primaryKeyColumns: ["id"],
-            sourceQuery: "SELECT \"id\" FROM \"buildings\"",
-            targetTable: "buildings",
-            targetSchema: nil,
-            estimatedRows: nil,
-            copiesData: true,
-            copiesIdentityColumn: false,
-            note: nil
-        )
-        let request = ObjectCopyRequest(
-            source: endpoint("app"),
-            destination: .existing(endpoint("staging")),
-            objects: [selection],
-            content: .data,
-            existingPolicy: .replace,
-            errorHandling: .stopAndRollback,
-            wrapEachTableInTransaction: true
-        )
-        let plan = ObjectCopyPlan(
-            request: request,
-            createsDatabase: false,
-            tableSteps: [step],
-            definitionSteps: [],
-            schemaStatements: []
-        )
-        let plugin = RecordingCopyDriver(sessionState: .idle, relaxesForeignKeys: true)
-        let adapter = PluginDriverAdapter(
-            connection: TestFixtures.makeConnection(type: .duckdb), pluginDriver: plugin
-        )
-        let runner = ObjectCopyRunner(manager: StubMetadataProvider(driver: adapter), gate: AlwaysAllowGate())
+    /// PostgreSQL commits an aborted transaction as a ROLLBACK, so a run that keeps going past a
+    /// failure would report tables that were never created.
+    @Test(
+        "Only a run that promises a rollback puts the structure in a transaction",
+        arguments: [ImportErrorHandling.skipAndContinue, .stopAndCommit]
+    )
+    func structureWithoutRollbackHasNoTransaction(errorHandling: ImportErrorHandling) async throws {
+        let log = CopyEventLog()
 
-        _ = try await runner.run(plan, progress: ObjectCopyProgress(progress: Progress()))
+        _ = try await run(
+            replacementPlan(errorHandling: errorHandling),
+            source: RecordingCopyDriver("source", log: log),
+            target: RecordingCopyDriver("target", log: log)
+        )
 
-        #expect(plugin.executed.first == "FK OFF")
-        #expect(plugin.executed.last == "FK ON")
+        #expect(log.events == [
+            "target open relaxedForeignKeys",
+            "target DROP TABLE orders;",
+            "target CREATE TABLE orders (id INTEGER);",
+            "target close relaxedForeignKeys",
+        ])
+    }
+
+    // MARK: - Rows
+
+    @Test("Rows are written with the target's keys relaxed inside its transaction, and the source left alone")
+    func rowsAreRelaxedOnTheTargetInsideItsTransaction() async throws {
+        let log = CopyEventLog()
+
+        let result = try await run(
+            dataPlan([dataStep("buildings")]),
+            source: RecordingCopyDriver("source", log: log),
+            target: RecordingCopyDriver("target", log: log)
+        )
+
+        #expect(result.rowsCopied == 1)
+        #expect(log.events == [
+            "target begin",
+            "target open relaxedForeignKeys",
+            "source SELECT id FROM buildings",
+            "target insert",
+            "target close relaxedForeignKeys",
+            "target commit",
+        ])
+    }
+
+    /// Relaxed, the DELETE would leave rows in a table outside the copy pointing at nothing.
+    @Test("A clear that a table outside the copy references runs before the keys are relaxed")
+    func referencedClearRunsWithKeysOn() async throws {
+        let log = CopyEventLog()
+
+        _ = try await run(
+            dataPlan([dataStep("buildings", clears: true)]),
+            source: RecordingCopyDriver("source", log: log),
+            target: RecordingCopyDriver("target", log: log)
+        )
+
+        #expect(log.events == [
+            "target begin",
+            "target DELETE FROM buildings",
+            "target open relaxedForeignKeys",
+            "source SELECT id FROM buildings",
+            "target insert",
+            "target close relaxedForeignKeys",
+            "target commit",
+        ])
+    }
+
+    /// A self reference or a cycle refuses its own DELETE on MySQL with the checks on.
+    @Test("Clears that only the copy's own tables reference run with the keys relaxed")
+    func selfContainedClearRunsRelaxed() async throws {
+        let log = CopyEventLog()
+
+        _ = try await run(
+            dataPlan([dataStep("buildings", clears: true)], clearsAreSelfContained: true),
+            source: RecordingCopyDriver("source", log: log),
+            target: RecordingCopyDriver("target", log: log)
+        )
+
+        #expect(log.events == [
+            "target begin",
+            "target open relaxedForeignKeys",
+            "target DELETE FROM buildings",
+            "source SELECT id FROM buildings",
+            "target insert",
+            "target close relaxedForeignKeys",
+            "target commit",
+        ])
+    }
+
+    @Test("A copy that throws puts the target's keys back before rolling back")
+    func failedCopyRestoresKeys() async throws {
+        let log = CopyEventLog()
+
+        let result = try await run(
+            dataPlan([dataStep("buildings")]),
+            source: RecordingCopyDriver("source", log: log),
+            target: RecordingCopyDriver("target", log: log, failsInserts: true)
+        )
+
+        #expect(result.failedCount == 1)
+        #expect(log.events == [
+            "target begin",
+            "target open relaxedForeignKeys",
+            "source SELECT id FROM buildings",
+            "target insert",
+            "target close relaxedForeignKeys",
+            "target rollback",
+        ])
+    }
+
+    @Test("A stopped copy puts the target's keys back outside the cancellation")
+    func cancelledCopyRestoresKeys() async throws {
+        let log = CopyEventLog()
+        let plan = dataPlan([dataStep("buildings")])
+        let source = RecordingCopyDriver("source", log: log)
+        let target = RecordingCopyDriver("target", log: log, cancelsOnInsert: true)
+
+        let result = try await Task { try await run(plan, source: source, target: target) }.value
+
+        #expect(result.cancelled)
+        #expect(log.events == [
+            "target begin",
+            "target open relaxedForeignKeys",
+            "source SELECT id FROM buildings",
+            "target insert",
+            "target close relaxedForeignKeys",
+            "target rollback",
+        ])
+    }
+
+    @Test("Rows joining the session's own transaction keep its keys as they are")
+    func sessionTransactionIsNotRelaxed() async throws {
+        let log = CopyEventLog()
+
+        let result = try await run(
+            dataPlan([dataStep("buildings")]),
+            source: RecordingCopyDriver("source", log: log),
+            target: RecordingCopyDriver("target", log: log, sessionState: .inTransaction)
+        )
+
+        #expect(result.pendingInSessionTransaction)
+        #expect(log.events == ["source SELECT id FROM buildings", "target insert"])
+    }
+
+    /// The table still holds its own rows, so the source's would be appended beside them.
+    @Test("Under Skip and continue a table whose clear failed gets no rows")
+    func failedClearGetsNoRows() async throws {
+        let log = CopyEventLog()
+        let target = RecordingCopyDriver("target", log: log, failing: ["DELETE FROM buildings"])
+
+        let result = try await run(
+            dataPlan(
+                [dataStep("estates", clears: true), dataStep("buildings", clears: true)],
+                errorHandling: .skipAndContinue
+            ),
+            source: RecordingCopyDriver("source", log: log),
+            target: target
+        )
+
+        #expect(result.failures.map { $0.outcome.selection.name } == ["buildings"])
+        #expect(result.rowsCopied == 1)
+        #expect(log.events == [
+            "target DELETE FROM buildings",
+            "target DELETE FROM estates",
+            "target open relaxedForeignKeys",
+            "source SELECT id FROM estates",
+            "target insert",
+            "target close relaxedForeignKeys",
+        ])
     }
 }

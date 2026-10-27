@@ -290,6 +290,16 @@ final class SQLitePluginDriver: PluginDatabaseDriver, @unchecked Sendable {
         ["PRAGMA foreign_keys = ON"]
     }
 
+    // MARK: - Session Scope
+
+    func openSessionScope(for purpose: PluginSessionPurpose) async throws -> PluginSessionScope? {
+        try await SQLiteSessionScope.open(for: purpose) { try await self.execute(query: $0) }
+    }
+
+    func closeSessionScope(_ scope: PluginSessionScope) async throws {
+        try await SQLiteSessionScope.close(scope) { try await self.execute(query: $0) }
+    }
+
     // MARK: - User Query
 
     func executeBoundedQuery(query: String, rowCap: Int) async throws -> PluginQueryResult? {

@@ -903,7 +903,7 @@ extension PluginMetadataRegistry {
                     supportsSSH: false,
                     supportsSSL: false,
                     supportsCascadeDrop: false,
-                    supportsForeignKeyDisable: true,
+                    supportsForeignKeyDisable: false,
                     supportsReadOnlyMode: true,
                     supportsQueryProgress: false,
                     requiresReconnectForDatabaseSwitch: false,

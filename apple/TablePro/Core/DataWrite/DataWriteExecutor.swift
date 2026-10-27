@@ -120,6 +120,8 @@ enum DataWriteExecutor {
         }
 
         var sideStatements: [String] = []
+        // An epilogue sets a fixed value, so the scope is what gives SQLite back the foreign_keys it had.
+        let preserved = plan.prologue.isEmpty ? nil : await openPreservingScope(on: driver)
 
         func drainEpilogue() async {
             for statement in plan.epilogue {
@@ -132,6 +134,7 @@ enum DataWriteExecutor {
                     )
                 }
             }
+            await closePreservingScope(preserved, on: driver)
         }
 
         for statement in plan.prologue {
@@ -237,6 +240,25 @@ enum DataWriteExecutor {
 
         await drainEpilogue()
         return DataWriteRun(results: results, sideStatements: sideStatements)
+    }
+
+    private static func openPreservingScope(on driver: DatabaseDriver) async -> PluginSessionScope? {
+        do {
+            return try await driver.openSessionScope(for: .preserve)
+        } catch {
+            logger.warning("Save runs without saving the session settings: \(error.publicLogShape, privacy: .public)")
+            return nil
+        }
+    }
+
+    // Shielded like a rollback: a cancelled save still has to leave the session as it found it.
+    private static func closePreservingScope(_ scope: PluginSessionScope?, on driver: DatabaseDriver) async {
+        guard let scope else { return }
+        do {
+            try await TaskCancellationShield.run { try await driver.closeSessionScope(scope) }
+        } catch {
+            logger.error("Restoring the session settings after the save failed: \(error.publicLogShape, privacy: .public)")
+        }
     }
 
     private static func rowsFound(

@@ -34,7 +34,7 @@ internal struct ObjectCopyCreationScopes: Sendable {
 }
 
 internal extension ObjectCopyPlanner {
-    nonisolated private static let creationLogger = Logger(subsystem: "com.TablePro", category: "ObjectCopyPlanner")
+    nonisolated private static let logger = Logger(subsystem: "com.TablePro", category: "ObjectCopyPlanner")
 
     nonisolated static func definitionBuild(
         for input: ObjectCopyDefinitionInput,
@@ -152,12 +152,12 @@ internal extension ObjectCopyPlanner {
         let wanted = Set(names.map { $0.lowercased() })
         let scopes = await VerbatimTransferScopes.open(reading: SessionScopeHandle(plugin))
         do {
-            let tables = try await plugin.fetchTables(schema: schema).filter { wanted.contains($0.name.lowercased()) }
+            let listed = try await plugin.fetchTables(schema: schema)
             let reads = try await CompareMetadataService.read(
-                tables: tables,
+                tables: listed.filter { wanted.contains($0.name.lowercased()) },
                 schema: schema,
                 profile: .structure,
-                narrowed: true,
+                narrowed: CompareMetadataService.narrows(listed, to: wanted),
                 databaseType: databaseType,
                 indexedKinds: SourceObjectIndexes.carriedKinds(on: databaseType),
                 using: plugin
@@ -168,6 +168,76 @@ internal extension ObjectCopyPlanner {
             await scopes?.close()
             throw error
         }
+    }
+
+    /// Whether emptying `tables` breaks only keys between tables the copy empties too. Each key the
+    /// whole-scope read finds is matched the way `ForeignKeyTopologicalSort` keys its nodes, and a
+    /// read that is unavailable or fails answers false, which keeps the target's checks on.
+    nonisolated static func clearsAreSelfContained(
+        clearing tables: [String],
+        schema: String?,
+        namespace: String?,
+        slot: EngineNamespaceSlot,
+        using plugin: any PluginDatabaseDriver
+    ) async throws -> Bool {
+        guard !tables.isEmpty, plugin.providesBulkForeignKeyFetch else { return false }
+        let foreignKeys: [String: [PluginForeignKeyInfo]]
+        do {
+            foreignKeys = try await plugin.fetchAllForeignKeys(schema: schema)
+        } catch {
+            try rethrowCancellation(error)
+            logger.warning("Target foreign keys unreadable: \(error.publicLogShape, privacy: .public)")
+            return false
+        }
+        /// PostgreSQL reads a nil schema as the session's own, and its keys name that schema.
+        let namespace = namespace ?? plugin.currentSchema
+        let cleared = Set(tables.map { ForeignKeyTopologicalSort.Table(name: $0, schema: namespace).identifier })
+        return foreignKeys.allSatisfy { table, keys in
+            cleared.contains(ForeignKeyTopologicalSort.Table(name: table, schema: namespace).identifier)
+                || !keys.contains { key in
+                    let parent = ForeignKeyTopologicalSort.Table(
+                        name: key.referencedTable,
+                        schema: referencedSchema(of: key, readIn: namespace, slot: slot) ?? namespace
+                    )
+                    return cleared.contains(parent.identifier)
+                }
+        }
+    }
+
+    /// The key with its referenced schema spelled the way `namespace` spells it, where the two name
+    /// one container.
+    nonisolated static func pointedInto(
+        _ key: PluginForeignKeyInfo,
+        namespace: String?,
+        slot: EngineNamespaceSlot
+    ) -> PluginForeignKeyInfo {
+        let schema = referencedSchema(of: key, readIn: namespace, slot: slot)
+        guard schema != key.referencedSchema else { return key }
+        return PluginForeignKeyInfo(
+            name: key.name,
+            column: key.column,
+            referencedTable: key.referencedTable,
+            referencedColumn: key.referencedColumn,
+            referencedDatabase: key.referencedDatabase,
+            referencedSchema: schema,
+            onDelete: key.onDelete,
+            onUpdate: key.onUpdate
+        )
+    }
+
+    /// A MySQL key names its database as the server spells it, and a server with
+    /// `lower_case_table_names` 1 or 2 takes `Regest` and `regest` as one database, so on the
+    /// database slot a spelling that differs only by case is the namespace itself. PostgreSQL
+    /// schemas `App` and `app` are two schemas, so the schema slot never folds.
+    nonisolated static func referencedSchema(
+        of key: PluginForeignKeyInfo,
+        readIn namespace: String?,
+        slot: EngineNamespaceSlot
+    ) -> String? {
+        guard slot == .database, let referenced = key.referencedSchema, let namespace,
+              ObjectCopyNamespace.isSame(referenced, namespace)
+        else { return key.referencedSchema }
+        return namespace
     }
 
     nonisolated static func creationScopes(
@@ -260,7 +330,7 @@ internal extension ObjectCopyPlanner {
             result.scopes[selection.id] = try await fetch()
         } catch {
             try rethrowCancellation(error)
-            creationLogger.warning(
+            logger.warning(
                 "Creation settings read failed for \(selection.kind.rawValue, privacy: .public): \(error.publicLogShape, privacy: .public)"
             )
             result.unreadable.insert(selection.id)

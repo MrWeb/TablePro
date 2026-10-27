@@ -16,6 +16,8 @@ import TableProPluginKit
 /// each run over the whole list.
 internal struct ObjectCopyTableDraft {
     let selection: ObjectCopySelection
+    /// Kept for the dependency order, which waits until every scope has been read.
+    let read: TableStructureRead
     let snapshot: TableStructureSnapshot
     /// The same table said in the target's own types, which is what the target driver is handed.
     /// Identical to `snapshot` whenever the two engines share a type family, apart from an index the
@@ -54,6 +56,7 @@ internal struct ObjectCopyTableDraft {
         request: ObjectCopyRequest
     ) {
         self.selection = selection
+        self.read = read
         self.snapshot = snapshot
         self.rowScope = request.rowScope(for: selection)
         self.sourceSchema = sourceSchema

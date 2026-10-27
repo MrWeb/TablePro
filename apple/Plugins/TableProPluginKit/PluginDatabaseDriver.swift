@@ -570,7 +570,9 @@ public protocol PluginDatabaseDriver: AnyObject, Sendable {
     // Table operations (optional — return nil to use app-level fallback)
     func truncateTableStatements(table: String, schema: String?, cascade: Bool) -> [String]?
     func dropObjectStatement(name: String, objectType: String, schema: String?, cascade: Bool) -> String?
+    /// Turns the session's foreign key checks off. Runs outside a transaction, on the connection that writes.
     func foreignKeyDisableStatements() -> [String]?
+    /// Turns them on whatever they were before; a caller that needs the previous value back holds a session scope.
     func foreignKeyEnableStatements() -> [String]?
 
     /// `UPDATE <table> SET <assignments> WHERE <predicate>` in this engine's own form, or nil for that form. The host
