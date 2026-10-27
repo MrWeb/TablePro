@@ -269,17 +269,24 @@ internal struct ObjectCopyRunner {
                 && plugin.supportsTransactionalDDL && owner.opensTransaction
             if usesTransaction { try await plugin.beginTransaction(mode: .readWrite) }
 
-            var result = try await Self.withForeignKeysRelaxed(
-                on: plugin, when: writesTables && !usesTransaction && owner != .session
-            ) {
-                try await Self.executeTableDDL(
-                    schemaStatements: schemaStatements,
-                    groups: tableGroups,
-                    on: plugin,
-                    pinsSession: pinsSession,
-                    errorHandling: errorHandling,
-                    progress: progress
-                )
+            var result: DDLResult
+            do {
+                result = try await Self.withForeignKeysRelaxed(
+                    on: plugin, when: writesTables && !usesTransaction && owner != .session
+                ) {
+                    try await Self.executeTableDDL(
+                        schemaStatements: schemaStatements,
+                        groups: tableGroups,
+                        on: plugin,
+                        pinsSession: pinsSession,
+                        errorHandling: errorHandling,
+                        progress: progress
+                    )
+                }
+            } catch {
+                // The pool never ends a transaction, so the next lease would inherit an aborted one.
+                if usesTransaction { try? await plugin.rollbackTransaction() }
+                throw error
             }
             /// Outside the write scope, because a routine or trigger records the session's
             /// `sql_mode`: it gets its own creation settings, or else the target's.
@@ -295,7 +302,12 @@ internal struct ObjectCopyRunner {
 
             guard usesTransaction else { return result }
             guard result.stopped else {
-                try await plugin.commitTransaction()
+                do {
+                    try await plugin.commitTransaction()
+                } catch {
+                    try? await plugin.rollbackTransaction()
+                    throw error
+                }
                 return result
             }
             try? await plugin.rollbackTransaction()

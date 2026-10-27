@@ -23,8 +23,19 @@ public enum SQLiteSessionScope {
         case .relaxedForeignKeys:
             guard let saved = try await readForeignKeys(execute), saved.value == on else { return nil }
             _ = try await execute(assignment(off))
+            // No scope reaches the caller past here, so nothing else would turn them back on.
+            let readBack: PluginSessionSetting?
+            do {
+                readBack = try await readForeignKeys(execute)
+            } catch {
+                _ = try? await execute(assignment(on))
+                throw error
+            }
             // The pragma is a no-op while a transaction is open, and says so only when read back.
-            guard try await readForeignKeys(execute)?.value == off else { return nil }
+            guard readBack?.value == off else {
+                _ = try? await execute(assignment(on))
+                return nil
+            }
             let applied = PluginSessionSetting(name: foreignKeys, value: off)
             return PluginSessionScope(purpose: purpose, saved: [saved], applied: [applied])
         case .verbatimRead, .verbatimWrite:

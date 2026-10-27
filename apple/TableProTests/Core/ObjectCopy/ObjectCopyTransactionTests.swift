@@ -298,6 +298,30 @@ struct ObjectCopyTransactionTests {
         ])
     }
 
+    @Test("A schema that cannot be created rolls the structure transaction back before the lease returns")
+    func failedSchemaRollsBack() async throws {
+        let log = CopyEventLog()
+        let createSchema = "CREATE SCHEMA staging"
+        let base = replacementPlan()
+        let plan = ObjectCopyPlan(
+            request: base.request,
+            createsDatabase: false,
+            tableSteps: base.tableSteps,
+            definitionSteps: [],
+            schemaStatements: [SyncStatement(sql: createSchema, objectName: "staging", summary: "schema")]
+        )
+
+        await #expect(throws: (any Error).self) {
+            _ = try await run(
+                plan,
+                source: RecordingCopyDriver("source", log: log),
+                target: RecordingCopyDriver("target", log: log, failing: [createSchema])
+            )
+        }
+
+        #expect(log.events == ["target begin", "target \(createSchema)", "target rollback"])
+    }
+
     // MARK: - Rows
 
     @Test("Rows are written with the target's keys relaxed inside its transaction, and the source left alone")
