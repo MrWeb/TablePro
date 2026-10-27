@@ -121,7 +121,12 @@ enum DataWriteExecutor {
 
         var sideStatements: [String] = []
         // An epilogue sets a fixed value, so the scope is what gives SQLite back the foreign_keys it had.
-        let preserved = plan.prologue.isEmpty ? nil : await openPreservingScope(on: driver)
+        // Inside the user's transaction the pragma does nothing, and PostgreSQL would put a SET LOCAL value
+        // back session-wide, past the transaction: there the toggles run as they always did.
+        var preserved: PluginSessionScope?
+        if !plan.prologue.isEmpty, !(await driver.heldSessionTransactionState()).holdsUserTransaction {
+            preserved = await openPreservingScope(on: driver)
+        }
 
         func drainEpilogue() async {
             for statement in plan.epilogue {

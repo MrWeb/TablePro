@@ -256,6 +256,26 @@ struct DataWriteExecutorTests {
         #expect(Array(counting.trace.suffix(3)) == ["ROLLBACK", "PRAGMA foreign_keys = ON", "close preserve"])
     }
 
+    /// PostgreSQL would put a `SET LOCAL` value back session-wide, where it outlives the user's transaction.
+    @Test(
+        "A save inside the user's transaction saves no session settings to put back",
+        arguments: [PluginSessionTransactionState.inTransaction, .abortedTransaction]
+    )
+    func saveInsideTheUsersTransactionOpensNoScope(state: PluginSessionTransactionState) async throws {
+        let counting = CountingDriver(affectedRows: 1, sessionState: state)
+        _ = try? await DataWriteExecutor.run(
+            plan(
+                expectedRowCount: 1,
+                prologue: ["SET session_replication_role = replica"],
+                epilogue: ["SET session_replication_role = origin"]
+            ),
+            on: driver(counting)
+        )
+
+        #expect(!counting.trace.contains("open preserve"))
+        #expect(counting.trace.contains("SET session_replication_role = origin"))
+    }
+
     @Test("A plan without a prologue leaves the session's settings alone")
     func planWithoutPrologueOpensNoScope() async throws {
         let counting = CountingDriver(affectedRows: 1)
