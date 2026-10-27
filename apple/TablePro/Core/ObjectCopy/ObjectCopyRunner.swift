@@ -406,6 +406,34 @@ internal struct ObjectCopyRunner {
         return ranAny
     }
 
+    /// Foreign key checks off for the rows, on the connection that writes them, as `mysqldump` does.
+    ///
+    /// Tables are copied in name order, so a child can arrive before its parent. Set outside the
+    /// transaction because SQLite ignores the pragma inside one. Put back before the lease ends,
+    /// shielded like a rollback, since the connection returns to the pool. An engine that refuses
+    /// the statement (Postgres without superuser) keeps its checks, as it did before.
+    nonisolated private static func withForeignKeysRelaxed<T>(
+        _ plugin: any PluginDatabaseDriver,
+        _ body: () async throws -> T
+    ) async throws -> T {
+        for statement in plugin.foreignKeyDisableStatements() ?? [] {
+            _ = try? await plugin.execute(query: statement)
+        }
+        func restore() async {
+            for statement in plugin.foreignKeyEnableStatements() ?? [] {
+                _ = try? await TaskCancellationShield.run { try await plugin.execute(query: statement) }
+            }
+        }
+        do {
+            let value = try await body()
+            await restore()
+            return value
+        } catch {
+            await restore()
+            throw error
+        }
+    }
+
     /// Each statement shielded like a rollback: the connection goes back to the pool after this
     /// lease, and a setting left behind would apply to whatever leases it next.
     nonisolated private static func closeSettings(
@@ -501,54 +529,56 @@ internal struct ObjectCopyRunner {
             guard let targetPlugin = CompareMetadataService.pluginDriver(from: targetDriver) else {
                 throw ObjectCopyError.refused(Self.noTargetDriver)
             }
-            let owner = await Self.transactionOwner(of: targetDriver)
-            let usesTransaction = owner.opensTransaction
-            if usesTransaction { try await targetPlugin.beginTransaction(mode: .readWrite) }
+            return try await Self.withForeignKeysRelaxed(targetPlugin) {
+                let owner = await Self.transactionOwner(of: targetDriver)
+                let usesTransaction = owner.opensTransaction
+                if usesTransaction { try await targetPlugin.beginTransaction(mode: .readWrite) }
 
-            var result = DataResult()
-            result.joinedSessionTransaction = owner == .session
-            let cleared = await Self.execute(
-                clearGroups, on: targetPlugin, errorHandling: errorHandling, progress: progress
-            )
-            result.outcomes += cleared.outcomes.filter { $0.error != nil }
-            result.cancelled = cleared.cancelled
-            result.stopped = cleared.stopped
-
-            if !result.stopped {
-                let copied = await Self.stream(
-                    steps,
-                    from: sourceScope,
-                    into: targetPlugin,
-                    manager: manager,
-                    sourceType: sourceType,
-                    targetType: targetType,
-                    errorHandling: errorHandling,
-                    progress: progress
+                var result = DataResult()
+                result.joinedSessionTransaction = owner == .session
+                let cleared = await Self.execute(
+                    clearGroups, on: targetPlugin, errorHandling: errorHandling, progress: progress
                 )
-                result.outcomes += copied.outcomes
-                result.cancelled = result.cancelled || copied.cancelled
-                result.stopped = copied.stopped
-                result.rowsCopied = copied.rowsCopied
-            }
+                result.outcomes += cleared.outcomes.filter { $0.error != nil }
+                result.cancelled = cleared.cancelled
+                result.stopped = cleared.stopped
 
-            guard usesTransaction else { return result }
-            guard result.stopped, errorHandling != .stopAndCommit else {
-                /// A commit that fails leaves the transaction open, and the clears are inside it,
-                /// so it is rolled back rather than left for the lease to decide.
-                do {
-                    try await targetPlugin.commitTransaction()
-                } catch {
-                    try? await targetPlugin.rollbackTransaction()
-                    throw error
+                if !result.stopped {
+                    let copied = await Self.stream(
+                        steps,
+                        from: sourceScope,
+                        into: targetPlugin,
+                        manager: manager,
+                        sourceType: sourceType,
+                        targetType: targetType,
+                        errorHandling: errorHandling,
+                        progress: progress
+                    )
+                    result.outcomes += copied.outcomes
+                    result.cancelled = result.cancelled || copied.cancelled
+                    result.stopped = copied.stopped
+                    result.rowsCopied = copied.rowsCopied
                 }
+
+                guard usesTransaction else { return result }
+                guard result.stopped, errorHandling != .stopAndCommit else {
+                    /// A commit that fails leaves the transaction open, and the clears are inside it,
+                    /// so it is rolled back rather than left for the lease to decide.
+                    do {
+                        try await targetPlugin.commitTransaction()
+                    } catch {
+                        try? await targetPlugin.rollbackTransaction()
+                        throw error
+                    }
+                    return result
+                }
+                try? await targetPlugin.rollbackTransaction()
+                /// The target is back where it started, rows and all, so nothing may be reported
+                /// as copied and no table may be reported as done.
+                result.outcomes = result.outcomes.filter { $0.error != nil }
+                result.rowsCopied = 0
                 return result
             }
-            try? await targetPlugin.rollbackTransaction()
-            /// The target is back where it started, rows and all, so nothing may be reported
-            /// as copied and no table may be reported as done.
-            result.outcomes = result.outcomes.filter { $0.error != nil }
-            result.rowsCopied = 0
-            return result
         }
     }
 
@@ -729,46 +759,48 @@ internal struct ObjectCopyRunner {
                 guard let targetPlugin = CompareMetadataService.pluginDriver(from: targetDriver) else {
                     throw ObjectCopyError.refused(Self.noTargetDriver)
                 }
-                let owner = await Self.transactionOwner(of: targetDriver)
-                let usesTransaction = wrapsInTransaction && owner.opensTransaction
-                if usesTransaction {
-                    try await targetPlugin.beginTransaction(mode: .readWrite)
-                }
-                do {
-                    let outcome = try await copier.copy(
-                        from: sourcePlugin,
-                        to: targetPlugin
-                    ) { rows in
-                        progress.setRowsForCurrentObject(rows, completedBefore: completedBefore)
-                    }
-                    guard usesTransaction else {
-                        /// Nothing of the copy's own to roll back, so every batch already flushed is
-                        /// in the target, or pending in the transaction the session already held,
-                        /// whether the user stopped or not.
-                        return CopiedRows(
-                            outcome: ObjectCopyRowCopier.Outcome(
-                                inserted: outcome.inserted,
-                                cancelled: outcome.cancelled,
-                                committed: outcome.inserted
-                            ),
-                            joinedSessionTransaction: owner == .session
-                        )
-                    }
-                    if outcome.cancelled {
-                        try? await targetPlugin.rollbackTransaction()
-                    } else {
-                        try await targetPlugin.commitTransaction()
-                    }
-                    return CopiedRows(outcome: outcome, joinedSessionTransaction: false)
-                } catch {
+                return try await Self.withForeignKeysRelaxed(targetPlugin) {
+                    let owner = await Self.transactionOwner(of: targetDriver)
+                    let usesTransaction = wrapsInTransaction && owner.opensTransaction
                     if usesTransaction {
-                        if errorHandling == .stopAndCommit {
-                            try? await targetPlugin.commitTransaction()
-                        } else {
-                            try? await targetPlugin.rollbackTransaction()
-                        }
+                        try await targetPlugin.beginTransaction(mode: .readWrite)
                     }
-                    throw error
+                    do {
+                        let outcome = try await copier.copy(
+                            from: sourcePlugin,
+                            to: targetPlugin
+                        ) { rows in
+                            progress.setRowsForCurrentObject(rows, completedBefore: completedBefore)
+                        }
+                        guard usesTransaction else {
+                            /// Nothing of the copy's own to roll back, so every batch already flushed is
+                            /// in the target, or pending in the transaction the session already held,
+                            /// whether the user stopped or not.
+                            return CopiedRows(
+                                outcome: ObjectCopyRowCopier.Outcome(
+                                    inserted: outcome.inserted,
+                                    cancelled: outcome.cancelled,
+                                    committed: outcome.inserted
+                                ),
+                                joinedSessionTransaction: owner == .session
+                            )
+                        }
+                        if outcome.cancelled {
+                            try? await targetPlugin.rollbackTransaction()
+                        } else {
+                            try await targetPlugin.commitTransaction()
+                        }
+                        return CopiedRows(outcome: outcome, joinedSessionTransaction: false)
+                    } catch {
+                        if usesTransaction {
+                            if errorHandling == .stopAndCommit {
+                                try? await targetPlugin.commitTransaction()
+                            } else {
+                                try? await targetPlugin.rollbackTransaction()
+                            }
+                        }
+                        throw error
+                    }
                 }
             }
         }

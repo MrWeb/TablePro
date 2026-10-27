@@ -38,10 +38,15 @@ private final class RecordingCopyDriver: PluginDriverStub, @unchecked Sendable {
     private var statements: [String] = []
     private var transactions: [String] = []
     private var state: PluginSessionTransactionState
+    private let relaxesForeignKeys: Bool
 
-    init(sessionState: PluginSessionTransactionState) {
+    init(sessionState: PluginSessionTransactionState, relaxesForeignKeys: Bool = false) {
         state = sessionState
+        self.relaxesForeignKeys = relaxesForeignKeys
     }
+
+    func foreignKeyDisableStatements() -> [String]? { relaxesForeignKeys ? ["FK OFF"] : nil }
+    func foreignKeyEnableStatements() -> [String]? { relaxesForeignKeys ? ["FK ON"] : nil }
 
     var executed: [String] { lock.withLock { statements } }
     var transactionEvents: [String] { lock.withLock { transactions } }
@@ -151,5 +156,54 @@ struct ObjectCopyTransactionTests {
 
         #expect(driver.transactionEvents.isEmpty)
         #expect(result.pendingInSessionTransaction)
+    }
+
+    /// Tables arrive in name order, so a child can be written before its parent. The checks have to
+    /// be off on the connection that writes the rows, and back on before it returns to the pool.
+    @Test("The data phase writes rows with foreign key checks off and restores them")
+    func dataPhaseRelaxesForeignKeys() async throws {
+        let selection = ObjectCopySelection(kind: .table, name: "buildings", schema: nil)
+        let step = ObjectCopyTableStep(
+            selection: selection,
+            dropStatements: [],
+            sequenceStatements: [],
+            createStatements: [],
+            truncateStatements: [],
+            columns: [],
+            primaryKeyColumns: ["id"],
+            sourceQuery: "SELECT \"id\" FROM \"buildings\"",
+            targetTable: "buildings",
+            targetSchema: nil,
+            estimatedRows: nil,
+            copiesData: true,
+            copiesIdentityColumn: false,
+            note: nil
+        )
+        let request = ObjectCopyRequest(
+            source: endpoint("app"),
+            destination: .existing(endpoint("staging")),
+            objects: [selection],
+            content: .data,
+            existingPolicy: .replace,
+            errorHandling: .stopAndRollback,
+            wrapEachTableInTransaction: true
+        )
+        let plan = ObjectCopyPlan(
+            request: request,
+            createsDatabase: false,
+            tableSteps: [step],
+            definitionSteps: [],
+            schemaStatements: []
+        )
+        let plugin = RecordingCopyDriver(sessionState: .idle, relaxesForeignKeys: true)
+        let adapter = PluginDriverAdapter(
+            connection: TestFixtures.makeConnection(type: .duckdb), pluginDriver: plugin
+        )
+        let runner = ObjectCopyRunner(manager: StubMetadataProvider(driver: adapter), gate: AlwaysAllowGate())
+
+        _ = try await runner.run(plan, progress: ObjectCopyProgress(progress: Progress()))
+
+        #expect(plugin.executed.first == "FK OFF")
+        #expect(plugin.executed.last == "FK ON")
     }
 }
