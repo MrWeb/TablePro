@@ -716,7 +716,7 @@ extension PluginMetadataRegistry {
         ]
         return defaults + mysqlVariantDefaults(
             dialect: mysqlDialect, mysqlColumnTypes: mysqlColumnTypes, idleReleaseField: mysqlIdleReleaseField
-        )
+        ) + defaults.filter { $0.typeId == "PostgreSQL" }.flatMap { kingbaseESDefaults(postgreSQL: $0.snapshot) }
     }
 }
 

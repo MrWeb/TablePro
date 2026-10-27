@@ -25,7 +25,7 @@ final class LibPQDriverCore: @unchecked Sendable {
     var currentSchema: String = "public"
     private var selectedSchema: String?
 
-    var onPostConnect: (@Sendable () async -> Void)?
+    var onPostConnect: (@Sendable () async throws -> Void)?
 
     /// Set by `LibPQBackedDriver` for the span of one connect, so every driver built on this
     /// core reports its handshake steps without having to thread a parameter through its own
@@ -124,7 +124,7 @@ final class LibPQDriverCore: @unchecked Sendable {
                     currentSchema = selectedSchema
                 }
 
-                await onPostConnect?()
+                try await onPostConnect?()
                 try await pqConn.finishConnecting()
                 try Task.checkCancellation()
             } onCancel: {

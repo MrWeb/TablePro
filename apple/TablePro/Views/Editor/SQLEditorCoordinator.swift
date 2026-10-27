@@ -131,6 +131,12 @@ final class SQLEditorCoordinator: ObservableObject, TextViewCoordinator, TextVie
     var tabID: UUID?
     var connectionId: UUID?
     var sourceFileURL: URL?
+    /// The connection's execution grammar, which `SQLEditorController` sets from the live session.
+    private(set) var sessionGrammar: SQLLexicalGrammar?
+
+    var lexicalGrammar: SQLLexicalGrammar {
+        sessionGrammar ?? (databaseType ?? .mysql).lexicalGrammar
+    }
 
     /// Whether the editor text view is currently the first responder.
     /// Used to guard cursor propagation — when the find panel highlights
@@ -191,7 +197,7 @@ final class SQLEditorCoordinator: ObservableObject, TextViewCoordinator, TextVie
         installFoldPreview(controller: controller)
         installStatementRunControls(controller: controller)
         installInlineSuggestionManager(controller: controller)
-        diagnosticsController.configure(databaseType: databaseType)
+        diagnosticsController.configure(databaseType: databaseType, grammar: lexicalGrammar)
         diagnosticsController.install(on: controller)
         diagnosticsController.scheduleRefresh(for: controller)
         applyKeyBindings(controller: controller)
@@ -362,13 +368,28 @@ final class SQLEditorCoordinator: ObservableObject, TextViewCoordinator, TextVie
     }
 
     private func installStatementRunControls(controller: TextViewController) {
-        statementRunController.grammar = (databaseType ?? .mysql).lexicalGrammar
+        statementRunController.grammar = lexicalGrammar
         statementRunController.statementModel = QueryStatementModel.forDatabaseType(databaseType ?? .mysql)
         statementRunController.isHighlightEnabled = AppSettingsManager.shared.editor.highlightCurrentStatement
         statementRunController.onRun = { [weak self] sql, offset in
             self?.onRunStatement?(sql, offset) ?? false
         }
         statementRunController.install(on: controller)
+    }
+
+    /// Moves the run controls and diagnostics to `grammar`, as a connect, a reconnect or a `SET` changes it.
+    func setSessionGrammar(_ grammar: SQLLexicalGrammar) {
+        guard grammar != sessionGrammar else { return }
+        sessionGrammar = grammar
+        guard hasInstalledEditorServices, !isDestroyed, let controller else { return }
+        statementRunController.grammar = grammar
+        statementRunController.refreshControls(in: controller)
+        statementRunController.refreshHighlight(in: controller)
+        diagnosticsController.configure(databaseType: databaseType, grammar: grammar)
+        refreshDiagnostics(
+            in: controller,
+            isLargeDocument: controller.textView.textStorage.length > Self.languageServiceLengthLimit
+        )
     }
 
     /// Turns the run controls off for the length of a query, because a tab runs one at a time.

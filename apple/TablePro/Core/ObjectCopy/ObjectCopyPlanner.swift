@@ -170,7 +170,10 @@ internal struct ObjectCopyPlanner {
             schemaStatements: try await buildSchemaStatements(request, namespaces: targetNamespaces),
             skipped: skipped,
             isStructureReadPinned: isStructureReadPinned,
-            keysInside: keysInside
+            keysInside: keysInside,
+            targetGrammar: SQLLexicalResolver.executionGrammar(
+                for: request.target.databaseType, connectionId: request.target.connectionId
+            )
         )
     }
 
@@ -249,7 +252,12 @@ internal struct ObjectCopyPlanner {
             scope: targetScope(request, endpoint: request.target)
         ) { driver in
             guard let plugin = CompareMetadataService.pluginDriver(from: driver) else { return [] }
-            let scriptText = SQLScriptText(databaseType: driver.connection.type)
+            let scriptText = SQLScriptText(
+                databaseType: driver.connection.type,
+                grammar: SQLLexicalResolver.readings(
+                    for: driver.connection.type, session: driver.sessionLexicalState
+                ).execution
+            )
             return namespaces.flatMap { name -> [SyncStatement] in
                 guard let sql = plugin.createSchemaStatement(name: name) else { return [] }
                 let summary = String(format: String(localized: "Create schema %@"), name)
@@ -333,7 +341,9 @@ internal struct ObjectCopyPlanner {
             from: request.source.databaseType,
             to: request.target.databaseType,
             sourceLanguage: PluginManager.shared.editorLanguage(for: request.source.databaseType),
-            targetLanguage: PluginManager.shared.editorLanguage(for: request.target.databaseType)
+            targetLanguage: PluginManager.shared.editorLanguage(for: request.target.databaseType),
+            sourceSession: manager.driver(for: request.source.connectionId)?.sessionLexicalState,
+            targetSession: manager.driver(for: request.target.connectionId)?.sessionLexicalState
         ) {
             throw ObjectCopyError.refused(reason)
         }
@@ -926,7 +936,8 @@ internal struct ObjectCopyPlanner {
                 format: String(localized: "Every row already in %@ is removed."), table
             )
         )]
-        return SQLScriptText(databaseType: databaseType).sendableStatements(sql).map { statement in
+        let grammar = SQLLexicalResolver.readings(for: databaseType, session: driver.sessionLexicalState).execution
+        return SQLScriptText(databaseType: databaseType, grammar: grammar).sendableStatements(sql).map { statement in
             SyncStatement(sql: statement, objectName: table, summary: summary, hazards: hazards)
         }
     }
@@ -958,7 +969,10 @@ internal struct ObjectCopyPlanner {
         /// engines alone, so one skip per object here costs nothing while reading every body first
         /// and discarding all of them costs a round trip per object.
         if let reason = ObjectCopyEligibility.definitionEngineRefusal(
-            from: request.source.databaseType, to: request.target.databaseType
+            from: request.source.databaseType,
+            to: request.target.databaseType,
+            sourceSession: manager.driver(for: request.source.connectionId)?.sessionLexicalState,
+            targetSession: manager.driver(for: request.target.connectionId)?.sessionLexicalState
         ) {
             skipped += selections.map { ObjectCopySkip(selection: $0, reason: reason) }
             return []
@@ -984,7 +998,12 @@ internal struct ObjectCopyPlanner {
             sourceReads: sourceReads,
             connection: connection
         )
-        let targetScriptText = SQLScriptText(databaseType: request.target.databaseType)
+        let targetScriptText = SQLScriptText(
+            databaseType: request.target.databaseType,
+            grammar: SQLLexicalResolver.executionGrammar(
+                for: request.target.databaseType, connectionId: request.target.connectionId
+            )
+        )
         var pending: [(
             selection: ObjectCopySelection, definition: String, read: RoutineSourceRead, target: ObjectCopySelection?
         )] = []

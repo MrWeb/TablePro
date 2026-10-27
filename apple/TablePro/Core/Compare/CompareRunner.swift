@@ -364,7 +364,13 @@ internal struct CompareRunner {
             options: session.structureOptions,
             sourceDatabaseType: context.source.databaseType,
             targetDatabaseType: context.target.databaseType,
-            targetIndexedKinds: SourceObjectIndexes.carriedKinds(on: context.target.databaseType)
+            targetIndexedKinds: SourceObjectIndexes.carriedKinds(on: context.target.databaseType),
+            sourceGrammar: SQLLexicalResolver.executionGrammar(
+                for: context.source.databaseType, connectionId: context.source.connectionId
+            ),
+            targetGrammar: SQLLexicalResolver.executionGrammar(
+                for: context.target.databaseType, connectionId: context.target.connectionId
+            )
         )
 
         /// Each pair reads two independent endpoints, so the two sides run together rather than the

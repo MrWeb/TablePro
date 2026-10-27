@@ -31,6 +31,9 @@ struct FilterSQLGenerator {
     private let stringLiteralPrefix: String
     /// The engine's type family, for the comparisons a dialect descriptor cannot describe.
     private let family: SQLTypeFamily?
+    // Oracle reads the literal '' as NULL, and so does KingbaseES in Oracle mode, which its type cannot tell apart
+    // from its PostgreSQL mode, so `c != ''` matches no row there.
+    private let readsEmptyStringAsNull: Bool
 
     init(
         dialect: SQLDialectDescriptor,
@@ -45,6 +48,7 @@ struct FilterSQLGenerator {
         self.columnTypesByName = ColumnTypeSQLQuoting.lookupByName(columns: columns, columnTypes: columnTypes)
         self.stringLiteralPrefix = stringLiteralPrefix
         self.family = databaseType.map(SQLTypeFamily.of)
+        self.readsEmptyStringAsNull = family == .oracle || databaseType == .kingbasees
     }
 
     /// The one place a string literal is spelled, so the engine's prefix cannot be forgotten on
@@ -125,13 +129,15 @@ struct FilterSQLGenerator {
             guard ColumnTypeSQLQuoting.supportsEmptyStringComparison(columnType) else {
                 return "\(quotedColumn) IS NULL"
             }
-            return "(\(quotedColumn) IS NULL OR \(patternOperand(quotedColumn, columnType: columnType)) = '')"
+            let operand = patternOperand(quotedColumn, columnType: columnType)
+            return "(\(quotedColumn) IS NULL OR \(emptyValueTest(operand, negated: false)))"
 
         case .isNotEmpty:
             guard ColumnTypeSQLQuoting.supportsEmptyStringComparison(columnType) else {
                 return "\(quotedColumn) IS NOT NULL"
             }
-            return "(\(quotedColumn) IS NOT NULL AND \(patternOperand(quotedColumn, columnType: columnType)) != '')"
+            let operand = patternOperand(quotedColumn, columnType: columnType)
+            return "(\(quotedColumn) IS NOT NULL AND \(emptyValueTest(operand, negated: true)))"
 
         case .inList:
             return generateInCondition(
@@ -162,6 +168,11 @@ struct FilterSQLGenerator {
                 column: operand, pattern: filter.value, ignoresCase: !filter.isCaseSensitive
             )
         }
+    }
+
+    private func emptyValueTest(_ operand: String, negated: Bool) -> String {
+        guard readsEmptyStringAsNull else { return "\(operand) \(negated ? "!=" : "=") ''" }
+        return "LENGTH(\(operand)) \(negated ? ">" : "=") 0"
     }
 
     /// SQLite keeps integer 5 and text '5' apart in a column with no affinity, and the grid reads both as `5`,

@@ -20,7 +20,12 @@ internal struct SchemaSyncScriptBuilder {
     internal init(targetDriver: any PluginDatabaseDriver, targetDatabaseType: DatabaseType) {
         self.targetDriver = targetDriver
         self.targetTypeFamily = SQLTypeFamily.of(targetDatabaseType)
-        self.scriptText = SQLScriptText(databaseType: targetDatabaseType)
+        self.scriptText = SQLScriptText(
+            databaseType: targetDatabaseType,
+            grammar: SQLLexicalResolver.readings(
+                for: targetDatabaseType, session: targetDriver.sessionLexicalState
+            ).execution
+        )
     }
 
     internal func build(

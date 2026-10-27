@@ -5782,6 +5782,12 @@
         }
       }
     },
+    "%@ runs in a compatibility mode with column types of its own, so structures can be compared but no script is generated." : {
+
+    },
+    "%@ runs in a compatibility mode with column types of its own. Copy to a target of the same type in the same mode." : {
+
+    },
     "%@ s" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -99206,6 +99212,10 @@
         }
       }
     },
+    "KingbaseES in %@ mode is not supported. Connect to a server in PostgreSQL or Oracle mode." : {
+      "extractionState" : "manual",
+      "generatesSymbol" : false
+    },
     "kubectl port-forward" : {
       "localizations" : {
         "fr" : {
@@ -134498,6 +134508,9 @@
         }
       }
     },
+    "PostgreSQL and Oracle compatible SQL" : {
+
+    },
     "PostgreSQL custom archive" : {
       "localizations" : {
         "fr" : {
@@ -135057,6 +135070,9 @@
           }
         }
       }
+    },
+    "Preferred tries TLS first, falls back to plain." : {
+
     },
     "Preferred tries TLS first, falls back to plain. Matches psql and DataGrip defaults. Required by AWS RDS, Cloud SQL, Heroku, Supabase, Neon." : {
       "localizations" : {

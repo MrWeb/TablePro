@@ -190,6 +190,18 @@ struct DataWriteExecutorTests {
         #expect(counting.didRollBack)
     }
 
+    @Test("A KingbaseES keyless write that found no row is rolled back, as libpq reports a real count")
+    func kingbaseKeylessWriteThatMatchedNothingFails() async throws {
+        let counting = CountingDriver(affectedRows: 0)
+        await #expect(throws: DataWriteError.rowsNoLongerMatch(table: "t", expected: 1, actual: 0)) {
+            try await DataWriteExecutor.run(
+                plan(expectedRowCount: 1, matchesRowsWithoutKey: true, databaseType: .kingbasees),
+                on: driver(counting)
+            )
+        }
+        #expect(counting.didRollBack)
+    }
+
     @Test("An engine whose driver reports no real count is not held to one")
     func keylessWriteOnAnEngineWithoutCountsSucceeds() async throws {
         let counting = CountingDriver(affectedRows: 0)

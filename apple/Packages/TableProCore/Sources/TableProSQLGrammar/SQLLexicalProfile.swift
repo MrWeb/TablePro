@@ -219,6 +219,13 @@ public struct SQLLexicalProfile: Sendable, Hashable {
             "AlloyDB": postgreSQLFamily,
             "Citus": postgreSQLFamily,
             "PGlite": postgreSQLFamily,
+            "KingbaseES": SQLLexicalProfile(
+                grammar: postgreSQL,
+                undetermined: [
+                    .backslashEscapesInSingleQuotes, .alternativeQuoting, .plsqlBlocks,
+                    .slashLineTerminators, .dollarAndHashInIdentifiers,
+                ]
+            ),
             "Redshift": SQLLexicalProfile(
                 grammar: postgreSQL,
                 undetermined: [.backslashEscapesInSingleQuotes, .nestedBlockComments, .escapeStringPrefix]
