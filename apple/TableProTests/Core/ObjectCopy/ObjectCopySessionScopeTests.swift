@@ -332,7 +332,7 @@ struct ObjectCopySessionScopeTests {
             createsDatabase: false,
             tableSteps: [step()],
             definitionSteps: [],
-            keysStayInside: true
+            keysInside: ObjectCopyKeysInside(created: true, rows: true)
         )
         let provider = TwoConnectionProvider(drivers: [
             sourceScope.connectionId: PluginDriverAdapter(

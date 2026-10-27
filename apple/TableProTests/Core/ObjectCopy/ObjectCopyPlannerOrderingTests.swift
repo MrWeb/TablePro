@@ -407,12 +407,15 @@ struct ObjectCopyPlannerOrderingTests {
 
     // MARK: - Keys inside the copy
 
-    private func keysStayInside(
+    private func keysInside(
         _ selections: [ObjectCopySelection],
         reads: [ObjectCopySelection: TableStructureRead],
+        created: Set<ObjectCopySelection>? = nil,
         rows: [ObjectCopySelection: Bool]
-    ) -> Bool {
-        ObjectCopyPlanner.keysStayInside([(namespace: "public", tables: selections)], reads: reads, rows: rows)
+    ) -> ObjectCopyKeysInside {
+        ObjectCopyPlanner.keysInside(
+            [(namespace: "public", tables: selections)], reads: reads, created: created ?? Set(selections), rows: rows
+        )
     }
 
     @Test
@@ -424,34 +427,43 @@ struct ObjectCopyPlannerOrderingTests {
             customers: read("customers", referencing: ["orders", "customers"])
         ]
 
-        #expect(keysStayInside([orders, customers], reads: reads, rows: [orders: true, customers: true]))
+        let inside = keysInside([orders, customers], reads: reads, rows: [orders: true, customers: true])
+
+        #expect(inside == ObjectCopyKeysInside(created: true, rows: true))
     }
 
     @Test
     func aChildWithoutItsParentPointsOutside() {
         let orders = selection("orders")
 
-        #expect(!keysStayInside([orders], reads: [orders: read("orders", referencing: ["customers"])], rows: [orders: true]))
-    }
+        let inside = keysInside([orders], reads: [orders: read("orders", referencing: ["customers"])], rows: [orders: true])
 
-    @Test
-    func aParentMissingRowsLeavesItsChildOutside() {
-        let orders = selection("orders")
-        let customers = selection("customers")
-        let reads = [orders: read("orders", referencing: ["customers"]), customers: read("customers")]
-
-        #expect(!keysStayInside([orders, customers], reads: reads, rows: [orders: true, customers: false]))
-        #expect(!keysStayInside([orders, customers], reads: reads, rows: [orders: true]))
+        #expect(inside == ObjectCopyKeysInside(created: false, rows: false))
     }
 
     /// A table that gets no rows only needs its parent created, not filled.
     @Test
-    func structureNeedsOnlyTheParentInTheCopy() {
+    func aParentMissingRowsLeavesOnlyTheRowsOutside() {
         let orders = selection("orders")
         let customers = selection("customers")
         let reads = [orders: read("orders", referencing: ["customers"]), customers: read("customers")]
 
-        #expect(keysStayInside([orders, customers], reads: reads, rows: [:]))
+        #expect(keysInside([orders, customers], reads: reads, rows: [orders: true, customers: false])
+            == ObjectCopyKeysInside(created: true, rows: false))
+        #expect(keysInside([orders, customers], reads: reads, rows: [orders: true])
+            == ObjectCopyKeysInside(created: true, rows: false))
+        #expect(keysInside([orders, customers], reads: reads, rows: [:])
+            == ObjectCopyKeysInside(created: true, rows: true))
+    }
+
+    /// The source's keys say nothing about a table the target keeps, which may reference a parent the copy never touches.
+    @Test
+    func aTableTheTargetKeepsLeavesTheRowsOutside() {
+        let orders = selection("orders")
+
+        let inside = keysInside([orders], reads: [orders: read("orders")], created: [], rows: [orders: true])
+
+        #expect(inside == ObjectCopyKeysInside(created: true, rows: false))
     }
 
     @Test
@@ -463,13 +475,17 @@ struct ObjectCopyPlannerOrderingTests {
             users: read("users", tableSchema: "core")
         ]
 
-        #expect(ObjectCopyPlanner.keysStayInside(
+        let whole = ObjectCopyPlanner.keysInside(
             [(namespace: "app", tables: [orders]), (namespace: "core", tables: [users])],
             reads: reads,
+            created: [orders, users],
             rows: [orders: true, users: true]
-        ))
-        #expect(!ObjectCopyPlanner.keysStayInside(
-            [(namespace: "app", tables: [orders])], reads: reads, rows: [orders: true]
-        ))
+        )
+        let alone = ObjectCopyPlanner.keysInside(
+            [(namespace: "app", tables: [orders])], reads: reads, created: [orders], rows: [orders: true]
+        )
+
+        #expect(whole == ObjectCopyKeysInside(created: true, rows: true))
+        #expect(alone == ObjectCopyKeysInside(created: false, rows: false))
     }
 }

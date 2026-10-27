@@ -109,9 +109,10 @@ internal struct ObjectCopyPlanner {
         }
         let parentsFirst = Self.orderAcrossScopes(&passes)
         let drafts = passes.flatMap(\.drafts)
-        let keysStayInside = Self.keysStayInside(
+        let keysInside = Self.keysInside(
             passes.map { (namespace: $0.sourceNamespace, tables: $0.drafts.map(\.selection)) },
             reads: Dictionary(drafts.map { ($0.selection, $0.read) }, uniquingKeysWith: { first, _ in first }),
+            created: Set(drafts.filter(\.writesStructure).map(\.selection)),
             rows: Dictionary(
                 drafts.filter(\.copiesData).map { draft in
                     let scope = draft.rowScope
@@ -168,7 +169,7 @@ internal struct ObjectCopyPlanner {
             schemaStatements: try await buildSchemaStatements(request, namespaces: targetNamespaces),
             skipped: skipped,
             isStructureReadPinned: isStructureReadPinned,
-            keysStayInside: keysStayInside
+            keysInside: keysInside
         )
     }
 
@@ -1133,35 +1134,41 @@ internal struct ObjectCopyPlanner {
         return result
     }
 
-    /// Whether every key a copied table holds points at a table in the copy, and, for a table that
-    /// gets rows, at one that gets all of its rows. `rows` holds each table that gets rows, true when
-    /// it gets every one.
-    ///
-    /// Only then may the target's checks be off: turning them back on checks nothing already
-    /// written, so a child copied without its parent's rows would keep pointing at nothing.
-    nonisolated internal static func keysStayInside(
+    /// `created` holds each table whose structure the copy writes, and `rows` each table that gets
+    /// rows, true when it gets every one. Keys are read from the source, which is what the target
+    /// holds only for a table the copy creates: one it keeps may carry keys of its own.
+    nonisolated internal static func keysInside(
         _ scopes: [(namespace: String?, tables: [ObjectCopySelection])],
         reads: [ObjectCopySelection: TableStructureRead],
+        created: Set<ObjectCopySelection>,
         rows: [ObjectCopySelection: Bool]
-    ) -> Bool {
-        var nodes: [(selection: ObjectCopySelection, read: TableStructureRead, node: ForeignKeyTopologicalSort.Table)] = []
+    ) -> ObjectCopyKeysInside {
+        var nodes: [(selection: ObjectCopySelection, keys: [PluginForeignKeyInfo], node: ForeignKeyTopologicalSort.Table)] = []
         for scope in scopes {
             for selection in scope.tables {
-                guard let read = reads[selection] else { return false }
-                nodes.append((selection, read, sortNode(selection, read: read, namespace: scope.namespace)))
+                guard let read = reads[selection] else { return ObjectCopyKeysInside() }
+                nodes.append((selection, read.foreignKeys, sortNode(selection, read: read, namespace: scope.namespace)))
+            }
+        }
+        func pointsWithin(
+            _ keys: [PluginForeignKeyInfo], from node: ForeignKeyTopologicalSort.Table, _ tables: Set<String>
+        ) -> Bool {
+            keys.allSatisfy { key in
+                tables.contains(ForeignKeyTopologicalSort.Table(
+                    name: key.referencedTable, schema: key.referencedSchema ?? node.schema
+                ).identifier)
             }
         }
         let present = Set(nodes.map(\.node.identifier))
         let filled = Set(nodes.filter { rows[$0.selection] == true }.map(\.node.identifier))
-        return nodes.allSatisfy { entry in
-            let parents = rows[entry.selection] == nil ? present : filled
-            return entry.read.foreignKeys.allSatisfy { key in
-                let parent = ForeignKeyTopologicalSort.Table(
-                    name: key.referencedTable, schema: key.referencedSchema ?? entry.node.schema
-                )
-                return parents.contains(parent.identifier)
+        return ObjectCopyKeysInside(
+            created: nodes.filter { created.contains($0.selection) }.allSatisfy {
+                pointsWithin($0.keys, from: $0.node, present)
+            },
+            rows: nodes.filter { rows[$0.selection] != nil }.allSatisfy {
+                created.contains($0.selection) && pointsWithin($0.keys, from: $0.node, filled)
             }
-        }
+        )
     }
 
     nonisolated private static func sortNode(

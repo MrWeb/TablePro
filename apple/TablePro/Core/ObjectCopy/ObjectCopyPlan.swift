@@ -207,6 +207,16 @@ internal struct ObjectCopyPartialNote: Identifiable, Sendable {
     internal var id: String { selection.id }
 }
 
+/// Whether the copy's foreign keys point only at tables it writes, which is when the target's checks
+/// may be off: turning them back on checks nothing already written.
+internal struct ObjectCopyKeysInside: Sendable, Equatable {
+    /// Every key of a table the copy creates names a table in the copy.
+    internal var created = false
+    /// Every table that gets rows is one the copy creates, so the target holds the source's keys
+    /// and no others, and each names a table that gets all of its rows.
+    internal var rows = false
+}
+
 internal struct ObjectCopyPlan: Sendable {
     internal let request: ObjectCopyRequest
     internal let createsDatabase: Bool
@@ -224,8 +234,7 @@ internal struct ObjectCopyPlan: Sendable {
     /// so the run may write that DDL under the target's write scope. A definition read as the
     /// session is runs as the session is, the way it did before scopes.
     internal let isStructureReadPinned: Bool
-    /// `ObjectCopyPlanner.keysStayInside`: whether the target's foreign key checks may be off.
-    internal let keysStayInside: Bool
+    internal let keysInside: ObjectCopyKeysInside
 
     internal init(
         request: ObjectCopyRequest,
@@ -235,7 +244,7 @@ internal struct ObjectCopyPlan: Sendable {
         schemaStatements: [SyncStatement] = [],
         skipped: [ObjectCopySkip] = [],
         isStructureReadPinned: Bool = false,
-        keysStayInside: Bool = false
+        keysInside: ObjectCopyKeysInside = ObjectCopyKeysInside()
     ) {
         self.request = request
         self.createsDatabase = createsDatabase
@@ -244,7 +253,7 @@ internal struct ObjectCopyPlan: Sendable {
         self.schemaStatements = schemaStatements
         self.skipped = skipped
         self.isStructureReadPinned = isStructureReadPinned
-        self.keysStayInside = keysStayInside
+        self.keysInside = keysInside
     }
 
     /// Shown above the script, for the caveats the copy cannot do anything about: a key column the

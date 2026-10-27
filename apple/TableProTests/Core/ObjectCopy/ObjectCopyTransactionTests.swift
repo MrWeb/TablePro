@@ -36,6 +36,7 @@ private final class RecordingCopyDriver: PluginDriverStub, @unchecked Sendable {
     private let failsInsertsAfter: Int?
     private let cancelsOnInsert: Bool
     private let rowCount: Int
+    private let transactional: Bool
     private var inserts = 0
 
     init(
@@ -46,7 +47,8 @@ private final class RecordingCopyDriver: PluginDriverStub, @unchecked Sendable {
         failsInserts: Bool = false,
         failsInsertsAfter: Int? = nil,
         cancelsOnInsert: Bool = false,
-        rowCount: Int = 1
+        rowCount: Int = 1,
+        transactional: Bool = true
     ) {
         self.name = name
         self.log = log
@@ -56,11 +58,12 @@ private final class RecordingCopyDriver: PluginDriverStub, @unchecked Sendable {
         self.failsInsertsAfter = failsInsertsAfter
         self.cancelsOnInsert = cancelsOnInsert
         self.rowCount = rowCount
+        self.transactional = transactional
     }
 
     var capabilities: PluginCapabilities { [] }
-    var supportsTransactions: Bool { true }
-    var supportsTransactionalDDL: Bool { true }
+    var supportsTransactions: Bool { transactional }
+    var supportsTransactionalDDL: Bool { transactional }
 
     private func record(_ event: String) {
         log.record("\(name) \(event)")
@@ -189,14 +192,14 @@ struct ObjectCopyTransactionTests {
     private func dataPlan(
         _ steps: [ObjectCopyTableStep],
         errorHandling: ImportErrorHandling = .stopAndRollback,
-        keysStayInside: Bool = true
+        keysInside: Bool = true
     ) -> ObjectCopyPlan {
         ObjectCopyPlan(
             request: request(steps.map(\.selection), content: .data, errorHandling: errorHandling),
             createsDatabase: false,
             tableSteps: steps,
             definitionSteps: [],
-            keysStayInside: keysStayInside
+            keysInside: ObjectCopyKeysInside(created: keysInside, rows: keysInside)
         )
     }
 
@@ -314,7 +317,7 @@ struct ObjectCopyTransactionTests {
 
     /// MySQL refuses a CREATE whose key names a missing table only while the checks are on.
     @Test("A new table relaxes the target's checks only when its keys stay inside the copy", arguments: [true, false])
-    func creationRelaxesOnlyInsideTheCopy(keysStayInside: Bool) async throws {
+    func creationRelaxesOnlyInsideTheCopy(keysInside: Bool) async throws {
         let log = CopyEventLog()
         let base = replacementPlan(errorHandling: .stopAndCommit)
         let created = base.tableSteps.map { step in
@@ -340,13 +343,13 @@ struct ObjectCopyTransactionTests {
             createsDatabase: false,
             tableSteps: created,
             definitionSteps: [],
-            keysStayInside: keysStayInside
+            keysInside: ObjectCopyKeysInside(created: keysInside)
         )
 
         _ = try await run(plan, source: RecordingCopyDriver("source", log: log), target: RecordingCopyDriver("target", log: log))
 
         let create = "target CREATE TABLE orders (id INTEGER);"
-        #expect(log.events == (keysStayInside
+        #expect(log.events == (keysInside
             ? ["target open relaxedForeignKeys", create, "target close relaxedForeignKeys"]
             : [create]))
     }
@@ -405,7 +408,7 @@ struct ObjectCopyTransactionTests {
         let log = CopyEventLog()
 
         _ = try await run(
-            dataPlan([dataStep("buildings")], keysStayInside: false),
+            dataPlan([dataStep("buildings")], keysInside: false),
             source: RecordingCopyDriver("source", log: log),
             target: RecordingCopyDriver("target", log: log)
         )
@@ -454,6 +457,46 @@ struct ObjectCopyTransactionTests {
         #expect(result.rowsCopied == SQLWriteBatchBudget.maximumRows)
         #expect(result.failures.map { $0.outcome.rowsCopied } == [SQLWriteBatchBudget.maximumRows])
         #expect(log.events == ["source SELECT id FROM buildings", "target insert", "target insert"])
+    }
+
+    @Test("A rolled back table reports none of the batches it wrote before failing")
+    func rolledBackFailureCountsNothing() async throws {
+        let log = CopyEventLog()
+
+        let result = try await run(
+            dataPlan([dataStep("buildings")]),
+            source: RecordingCopyDriver("source", log: log, rowCount: SQLWriteBatchBudget.maximumRows + 1),
+            target: RecordingCopyDriver("target", log: log, failsInsertsAfter: 1)
+        )
+
+        #expect(result.rowsCopied == 0)
+        #expect(result.failures.map { $0.outcome.rowsCopied } == [0])
+        #expect(log.events.last == "target rollback")
+    }
+
+    /// Nothing can be taken back there, so leaving the rows out of the count would send a retry over them.
+    @Test("A target with no transactions counts what a stopped or failed table wrote")
+    func untransactionalTargetCountsWhatItKept() async throws {
+        let log = CopyEventLog()
+
+        let stopped = try await Task {
+            try await run(
+                dataPlan([dataStep("buildings")]),
+                source: RecordingCopyDriver("source", log: log),
+                target: RecordingCopyDriver("target", log: log, cancelsOnInsert: true, transactional: false)
+            )
+        }.value
+        let failed = try await run(
+            dataPlan([dataStep("buildings")]),
+            source: RecordingCopyDriver("source", log: log, rowCount: SQLWriteBatchBudget.maximumRows + 1),
+            target: RecordingCopyDriver("target", log: log, failsInsertsAfter: 1, transactional: false)
+        )
+
+        #expect(stopped.cancelled)
+        #expect(stopped.rowsCopied == 1)
+        #expect(failed.rowsCopied == SQLWriteBatchBudget.maximumRows)
+        #expect(!log.events.contains("target begin"))
+        #expect(!log.events.contains("target open relaxedForeignKeys"))
     }
 
     /// Relaxed, a DELETE would leave rows in a table outside the copy pointing at nothing.

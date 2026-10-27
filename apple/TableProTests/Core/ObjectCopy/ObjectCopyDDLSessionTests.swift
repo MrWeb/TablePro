@@ -181,7 +181,7 @@ struct ObjectCopyDDLSessionTests {
             tableSteps: tables,
             definitionSteps: definitions,
             isStructureReadPinned: isStructureReadPinned,
-            keysStayInside: true
+            keysInside: ObjectCopyKeysInside(created: true, rows: true)
         )
     }
 

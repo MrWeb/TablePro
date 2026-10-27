@@ -257,7 +257,7 @@ internal struct ObjectCopyRunner {
         // yet, which a cycle always has. Past a replacement, a key to a table outside the copy keeps
         // the checks, so it still fails when that table is missing.
         let dropsTables = plan.cleanupGroups.contains { !$0.statements.isEmpty }
-        let relaxesKeys = tableGroups.contains { !$0.statements.isEmpty } && (dropsTables || plan.keysStayInside)
+        let relaxesKeys = tableGroups.contains { !$0.statements.isEmpty } && (dropsTables || plan.keysInside.created)
         let pinsSession = plan.isStructureReadPinned && VerbatimTransferScopes.isSameEngine(
             source: request.source.databaseType, target: request.target.databaseType
         )
@@ -502,9 +502,47 @@ internal struct ObjectCopyRunner {
         var stopped = false
         /// True when the rows went into a transaction the session already held.
         var joinedSessionTransaction = false
-        /// Only what was committed. A cancelled table rolls its rows back, so counting what the
-        /// copier inserted reported rows the target never kept.
+        /// Every row written, a stopped or failed table's included. A rollback takes the count back
+        /// with the rows; a target that opened no transaction keeps both, and leaving them out
+        /// would send a retry over them.
         var rowsCopied = 0
+
+        mutating func recordCopy(of step: ObjectCopyTableStep, inserted: Int) {
+            rowsCopied += inserted
+            outcomes.append(ObjectCopyObjectOutcome(selection: step.selection, rowsCopied: inserted, error: nil))
+        }
+
+        /// Stop reaching the driver mid-stream is the user stopping, not the copy failing, and the
+        /// two produce different notifications.
+        mutating func recordStop(of step: ObjectCopyTableStep, inserted: Int, progress: ObjectCopyProgress) {
+            cancelled = true
+            stopped = true
+            if inserted > 0 { recordCopy(of: step, inserted: inserted) }
+            progress.setRowsForCurrentObject(0, completedBefore: rowsCopied)
+        }
+
+        /// False when the run stops here.
+        mutating func recordFailure(
+            of step: ObjectCopyTableStep,
+            _ error: any Error,
+            errorHandling: ImportErrorHandling,
+            progress: ObjectCopyProgress
+        ) -> Bool {
+            ObjectCopyRunner.logger.error(
+                "Copy rows failed for \(step.qualifiedTargetName, privacy: .public): \(error.publicLogShape, privacy: .public)"
+            )
+            let written = (error as? ObjectCopyRowCopier.PartialFailure)?.written ?? 0
+            rowsCopied += written
+            progress.setRowsForCurrentObject(0, completedBefore: rowsCopied)
+            outcomes.append(ObjectCopyObjectOutcome(
+                selection: step.selection, rowsCopied: written, error: error.localizedDescription
+            ))
+            guard errorHandling == .skipAndContinue else {
+                stopped = true
+                return false
+            }
+            return true
+        }
     }
 
     private func runData(
@@ -542,7 +580,7 @@ internal struct ObjectCopyRunner {
         let targetType = request.target.databaseType
         let sourceScope = request.source.scope
         let errorHandling = request.errorHandling
-        let keysStayInside = plan.keysStayInside
+        let relaxesRows = plan.keysInside.rows
 
         /// A lease this phase cannot take is a run-level failure with no object to pin it on, and
         /// it is thrown for the same reason the DDL phases throw it: swallowed into a stopped
@@ -569,7 +607,7 @@ internal struct ObjectCopyRunner {
             result.stopped = cleared.stopped
 
             if !result.stopped {
-                try await Self.withForeignKeysRelaxed(on: targetPlugin, when: usesTransaction && keysStayInside) {
+                try await Self.withForeignKeysRelaxed(on: targetPlugin, when: usesTransaction && relaxesRows) {
                     let copied = await Self.stream(
                         steps,
                         from: sourceScope,
@@ -602,7 +640,9 @@ internal struct ObjectCopyRunner {
             try? await targetPlugin.rollbackTransaction()
             /// The target is back where it started, rows and all, so nothing may be reported
             /// as copied and no table may be reported as done.
-            result.outcomes = result.outcomes.filter { $0.error != nil }
+            result.outcomes = result.outcomes.filter { $0.error != nil }.map {
+                ObjectCopyObjectOutcome(selection: $0.selection, rowsCopied: 0, error: $0.error)
+            }
             result.rowsCopied = 0
             return result
         }
@@ -645,31 +685,15 @@ internal struct ObjectCopyRunner {
                     }
                 }
                 guard !outcome.cancelled else {
-                    result.cancelled = true
-                    result.stopped = true
-                    progress.setRowsForCurrentObject(0, completedBefore: result.rowsCopied)
+                    result.recordStop(of: step, inserted: outcome.inserted, progress: progress)
                     break
                 }
-                result.rowsCopied += outcome.inserted
-                result.outcomes.append(ObjectCopyObjectOutcome(
-                    selection: step.selection, rowsCopied: outcome.inserted, error: nil
-                ))
+                result.recordCopy(of: step, inserted: outcome.inserted)
             } catch is CancellationError {
-                result.cancelled = true
-                result.stopped = true
-                progress.setRowsForCurrentObject(0, completedBefore: result.rowsCopied)
+                result.recordStop(of: step, inserted: 0, progress: progress)
                 break
             } catch {
-                logger.error(
-                    "Copy rows failed for \(step.qualifiedTargetName, privacy: .public): \(error.publicLogShape, privacy: .public)"
-                )
-                result.outcomes.append(ObjectCopyObjectOutcome(
-                    selection: step.selection, rowsCopied: 0, error: error.localizedDescription
-                ))
-                guard errorHandling == .skipAndContinue else {
-                    result.stopped = true
-                    break
-                }
+                guard result.recordFailure(of: step, error, errorHandling: errorHandling, progress: progress) else { break }
             }
         }
         return result
@@ -706,45 +730,18 @@ internal struct ObjectCopyRunner {
                 let outcome = copied.outcome
                 result.joinedSessionTransaction =
                     result.joinedSessionTransaction || copied.joinedSessionTransaction
-                /// Nothing rolled back, so the batches already flushed are in the target, and
-                /// saying otherwise hides them from a user about to retry and double the rows.
                 guard !outcome.cancelled else {
-                    result.cancelled = true
-                    result.stopped = true
-                    if outcome.inserted > 0 {
-                        result.rowsCopied += outcome.inserted
-                        result.outcomes.append(ObjectCopyObjectOutcome(
-                            selection: step.selection, rowsCopied: outcome.inserted, error: nil
-                        ))
-                    }
-                    progress.setRowsForCurrentObject(0, completedBefore: result.rowsCopied)
+                    result.recordStop(of: step, inserted: outcome.inserted, progress: progress)
                     break
                 }
-                result.rowsCopied += outcome.inserted
-                result.outcomes.append(ObjectCopyObjectOutcome(
-                    selection: step.selection, rowsCopied: outcome.inserted, error: nil
-                ))
+                result.recordCopy(of: step, inserted: outcome.inserted)
             } catch is CancellationError {
-                /// Stop reaching the driver mid-stream is the user stopping, not the copy failing,
-                /// and the two produce different notifications.
-                result.cancelled = true
-                result.stopped = true
-                progress.setRowsForCurrentObject(0, completedBefore: result.rowsCopied)
+                result.recordStop(of: step, inserted: 0, progress: progress)
                 break
             } catch {
-                Self.logger.error(
-                    "Copy rows failed for \(step.qualifiedTargetName, privacy: .public): \(error.publicLogShape, privacy: .public)"
-                )
-                let written = (error as? ObjectCopyRowCopier.PartialFailure)?.written ?? 0
-                result.rowsCopied += written
-                progress.setRowsForCurrentObject(0, completedBefore: result.rowsCopied)
-                result.outcomes.append(ObjectCopyObjectOutcome(
-                    selection: step.selection, rowsCopied: written, error: error.localizedDescription
-                ))
-                guard request.errorHandling == .skipAndContinue else {
-                    result.stopped = true
-                    break
-                }
+                guard result.recordFailure(
+                    of: step, error, errorHandling: request.errorHandling, progress: progress
+                ) else { break }
             }
         }
         return result
