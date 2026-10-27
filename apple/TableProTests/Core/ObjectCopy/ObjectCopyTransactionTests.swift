@@ -533,11 +533,34 @@ struct ObjectCopyTransactionTests {
         #expect(result.rowsCopied == 1)
         #expect(log.events == [
             "target begin",
+            "target SELECT COUNT(*) FROM buildings",
             "target open relaxedForeignKeys",
             "source SELECT id FROM buildings",
             "target insert",
             "target SELECT COUNT(*) FROM buildings",
             "target close relaxedForeignKeys",
+            "target commit",
+        ])
+    }
+
+    /// A write-only login copies parents first with the checks on, as it did before they could be relaxed.
+    @Test("A key the account cannot check keeps the target's checks on")
+    func uncheckableKeyKeepsTheChecks() async throws {
+        let log = CopyEventLog()
+        let check = ObjectCopyKeyCheck(constraint: "fk_estate", sql: "SELECT COUNT(*) FROM buildings")
+
+        let result = try await run(
+            dataPlan([dataStep("buildings", keyChecks: [check])]),
+            source: RecordingCopyDriver("source", log: log),
+            target: RecordingCopyDriver("target", log: log, failing: [check.sql])
+        )
+
+        #expect(result.rowsCopied == 1)
+        #expect(log.events == [
+            "target begin",
+            "target SELECT COUNT(*) FROM buildings",
+            "source SELECT id FROM buildings",
+            "target insert",
             "target commit",
         ])
     }

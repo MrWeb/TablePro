@@ -607,7 +607,12 @@ internal struct ObjectCopyRunner {
             result.stopped = cleared.stopped
 
             if !result.stopped {
-                try await Self.withForeignKeysRelaxed(on: targetPlugin, when: usesTransaction && relaxesRows) { relaxed in
+                // Every table here was just created, so the checks cost nothing yet. One the account
+                // may not run, such as a SELECT on a write-only login, keeps the target's checks on.
+                let checkable = usesTransaction && relaxesRows
+                    ? await Self.keyChecksRun(steps, on: targetPlugin)
+                    : false
+                try await Self.withForeignKeysRelaxed(on: targetPlugin, when: checkable) { relaxed in
                     let copied = await Self.stream(
                         steps,
                         from: sourceScope,
@@ -797,6 +802,23 @@ internal struct ObjectCopyRunner {
                 return CopiedRows(outcome: outcome, joinedSessionTransaction: owner == .session)
             }
         }
+    }
+
+    nonisolated private static func keyChecksRun(
+        _ steps: [ObjectCopyTableStep],
+        on driver: any PluginDatabaseDriver
+    ) async -> Bool {
+        for check in steps.flatMap({ $0.keyChecks ?? [] }) {
+            do {
+                _ = try await driver.execute(query: check.sql)
+            } catch {
+                logger.warning(
+                    "Copying with foreign key checks on, \(check.constraint, privacy: .public) cannot be checked: \(error.publicLogShape, privacy: .public)"
+                )
+                return false
+            }
+        }
+        return true
     }
 
     /// Stops at the first key that fails, since the rollback that follows takes back every table.
