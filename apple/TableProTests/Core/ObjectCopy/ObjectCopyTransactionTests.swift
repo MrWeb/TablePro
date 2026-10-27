@@ -184,7 +184,7 @@ struct ObjectCopyTransactionTests {
     }
 
     private func dataStep(
-        _ table: String, clears: Bool = false, keyChecks: [ObjectCopyKeyCheck] = []
+        _ table: String, clears: Bool = false, keyChecks: [ObjectCopyKeyCheck] = [], rollsBack: Bool = true
     ) -> ObjectCopyTableStep {
         ObjectCopyTableStep(
             selection: ObjectCopySelection(kind: .table, name: table, schema: nil),
@@ -203,7 +203,8 @@ struct ObjectCopyTransactionTests {
             copiesData: true,
             copiesIdentityColumn: false,
             note: nil,
-            keyChecks: keyChecks
+            keyChecks: keyChecks,
+            rollsBack: rollsBack
         )
     }
 
@@ -556,6 +557,24 @@ struct ObjectCopyTransactionTests {
         #expect(result.rowsCopied == 0)
         #expect(result.failures.map { $0.outcome.selection.name } == ["buildings"])
         #expect(log.events.suffix(2) == ["target close relaxedForeignKeys", "target rollback"])
+    }
+
+    /// MySQL keeps a MyISAM table's rows through a ROLLBACK.
+    @Test("A table the target keeps through a rollback still reports its rows")
+    func tableThatCannotRollBackKeepsItsCount() async throws {
+        let log = CopyEventLog()
+
+        let result = try await run(
+            dataPlan([dataStep("audit", rollsBack: false), dataStep("buildings")]),
+            source: RecordingCopyDriver("source", log: log),
+            target: RecordingCopyDriver("target", log: log, failsInsertsAfter: 1)
+        )
+
+        #expect(log.events.last == "target rollback")
+        #expect(result.rowsCopied == 1)
+        #expect(result.outcomes.map { "\($0.selection.name) \($0.rowsCopied) \($0.error == nil)" } == [
+            "audit 1 true", "buildings 0 false",
+        ])
     }
 
     @Test(

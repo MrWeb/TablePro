@@ -554,7 +554,8 @@ internal struct ObjectCopyPlanner {
                 serverSideInsert: draft.copiesData ? serverSide[draft.selection.id] : nil,
                 hasRowFilter: VerbatimTransferScopes.filtersRows(draft.rowScope),
                 note: draft.note,
-                keyChecks: statements.keyChecks
+                keyChecks: statements.keyChecks,
+                rollsBack: draft.rollsBack
             )
         }
     }

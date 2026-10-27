@@ -65,6 +65,9 @@ internal struct ObjectCopyTableStep: Identifiable, Sendable {
     /// One count per foreign key this table is created with. Nil when a key cannot be checked,
     /// which keeps the target's checks on for the rows.
     internal let keyChecks: [ObjectCopyKeyCheck]?
+    /// False when the target keeps this table's rows through a ROLLBACK, so a rolled back run still
+    /// reports them.
+    internal let rollsBack: Bool
 
     /// Spelled out rather than left to the memberwise init so the three fields a same-engine copy
     /// never sets can default. Every one of them describes something only a crossing or a
@@ -88,9 +91,11 @@ internal struct ObjectCopyTableStep: Identifiable, Sendable {
         serverSideInsert: SyncStatement? = nil,
         hasRowFilter: Bool = false,
         note: String?,
-        keyChecks: [ObjectCopyKeyCheck]? = []
+        keyChecks: [ObjectCopyKeyCheck]? = [],
+        rollsBack: Bool = true
     ) {
         self.keyChecks = keyChecks
+        self.rollsBack = rollsBack
         self.selection = selection
         self.dropStatements = dropStatements
         self.sequenceStatements = sequenceStatements

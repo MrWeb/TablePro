@@ -43,6 +43,8 @@ internal struct ObjectCopyTableDraft {
     /// The `WHERE` and row limit the user set on this table, or nil for every row.
     let rowScope: PluginExportRowScope?
     let note: String?
+    /// False for a MySQL table whose storage engine keeps its rows through a ROLLBACK, such as MyISAM.
+    let rollsBack: Bool
 
     init(
         selection: ObjectCopySelection,
@@ -82,6 +84,10 @@ internal struct ObjectCopyTableDraft {
         )
         self.targetStructure = translation.snapshot
         self.isCrossEngine = translation.translated
+        self.rollsBack = !DataSyncTransactionality.cannotRollBack(
+            storageEngine: writesStructure ? translation.snapshot.engine : targetSnapshot?.engine,
+            databaseType: request.target.databaseType
+        )
         /// Only a run that writes the structure has anything to report about it. Appending into a
         /// table the target already has changes no type, so a list of conversions would describe
         /// DDL that is not going to run.

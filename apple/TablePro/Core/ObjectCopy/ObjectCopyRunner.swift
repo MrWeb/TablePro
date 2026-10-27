@@ -643,12 +643,16 @@ internal struct ObjectCopyRunner {
                 return result
             }
             try? await targetPlugin.rollbackTransaction()
-            /// The target is back where it started, rows and all, so nothing may be reported
-            /// as copied and no table may be reported as done.
-            result.outcomes = result.outcomes.filter { $0.error != nil }.map {
-                ObjectCopyObjectOutcome(selection: $0.selection, rowsCopied: 0, error: $0.error)
+            /// Nothing may be reported as copied that the rollback took back, and no such table as
+            /// done. A table the engine keeps through a ROLLBACK still holds its rows, and leaving
+            /// them out would send a retry over them.
+            let kept = Set(steps.filter { !$0.rollsBack }.map(\.id))
+            result.outcomes = result.outcomes.compactMap { outcome in
+                if kept.contains(outcome.id) { return outcome }
+                guard let error = outcome.error else { return nil }
+                return ObjectCopyObjectOutcome(selection: outcome.selection, rowsCopied: 0, error: error)
             }
-            result.rowsCopied = 0
+            result.rowsCopied = result.outcomes.filter { kept.contains($0.id) }.reduce(0) { $0 + $1.rowsCopied }
             return result
         }
     }
