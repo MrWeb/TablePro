@@ -83,13 +83,13 @@ internal enum PostgreSQLSessionScopeSQL {
 
     /// One statement, so the server applies every setting or none: a refused one rolls back the statement's
     /// implicit transaction, or the savepoint the connection holds around it inside a block. A nil value binds SQL
-    /// `NULL`, which `set_config` takes as a reset.
-    static func setStatement(_ settings: [PluginSessionSetting]) -> PostgreSQLBoundStatement? {
+    /// `NULL`, which `set_config` takes as a reset. `local` holds the values only until the transaction ends.
+    static func setStatement(_ settings: [PluginSessionSetting], local: Bool = false) -> PostgreSQLBoundStatement? {
         guard !settings.isEmpty else { return nil }
         var calls: [String] = []
         var parameters: [PluginCellValue] = []
         for (index, setting) in settings.enumerated() {
-            calls.append("pg_catalog.set_config($\(index * 2 + 1), $\(index * 2 + 2), false)")
+            calls.append("pg_catalog.set_config($\(index * 2 + 1), $\(index * 2 + 2), \(local))")
             parameters.append(.text(setting.name))
             parameters.append(setting.value.map { PluginCellValue.text($0) } ?? .null)
         }

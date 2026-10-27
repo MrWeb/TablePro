@@ -102,6 +102,15 @@ struct PostgreSQLSessionScopeSQLTests {
         #expect(statement.parameters == [.text("extra_float_digits"), .null])
     }
 
+    /// A value saved inside a transaction may be a `SET LOCAL` one, which must not outlive it.
+    @Test("Inside a transaction the values go back for that transaction only")
+    func localSetStatementEndsWithTheTransaction() throws {
+        let statement = try #require(PostgreSQLSessionScopeSQL.setStatement(
+            [Self.setting("session_replication_role", "replica")], local: true
+        ))
+        #expect(statement.sql == "SELECT pg_catalog.set_config($1, $2, true)")
+    }
+
     @Test("No settings, no statement")
     func emptySetIsNil() {
         #expect(PostgreSQLSessionScopeSQL.setStatement([]) == nil)
