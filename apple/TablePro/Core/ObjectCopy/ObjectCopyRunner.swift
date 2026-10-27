@@ -253,6 +253,8 @@ internal struct ObjectCopyRunner {
         let scope = request.target.scope
         let hasCleanup = !plan.cleanupGroups.isEmpty
         let schemaStatements = plan.schemaStatements
+        // A MySQL CREATE TABLE refuses a key to a table not created yet, which a cycle always has.
+        let writesTables = tableGroups.contains { !$0.statements.isEmpty }
         let pinsSession = plan.isStructureReadPinned && VerbatimTransferScopes.isSameEngine(
             source: request.source.databaseType, target: request.target.databaseType
         )
@@ -267,10 +269,10 @@ internal struct ObjectCopyRunner {
                 && plugin.supportsTransactionalDDL && owner.opensTransaction
             if usesTransaction { try await plugin.beginTransaction(mode: .readWrite) }
 
-            var result: DDLResult = try await Self.withForeignKeysRelaxed(
-                on: plugin, when: hasCleanup && !usesTransaction && owner != .session
+            var result = try await Self.withForeignKeysRelaxed(
+                on: plugin, when: writesTables && !usesTransaction && owner != .session
             ) {
-                var ddl = try await Self.executeTableDDL(
+                try await Self.executeTableDDL(
                     schemaStatements: schemaStatements,
                     groups: tableGroups,
                     on: plugin,
@@ -278,17 +280,16 @@ internal struct ObjectCopyRunner {
                     errorHandling: errorHandling,
                     progress: progress
                 )
-                /// Outside the write scope, because a routine or trigger records the session's
-                /// `sql_mode`: it gets its own creation settings, or else the target's.
-                if !ddl.stopped {
-                    let definitions = await Self.execute(
-                        definitionGroups, on: plugin, errorHandling: errorHandling, progress: progress
-                    )
-                    ddl.outcomes += definitions.outcomes
-                    ddl.cancelled = definitions.cancelled
-                    ddl.stopped = definitions.stopped
-                }
-                return ddl
+            }
+            /// Outside the write scope, because a routine or trigger records the session's
+            /// `sql_mode`: it gets its own creation settings, or else the target's.
+            if !result.stopped {
+                let definitions = await Self.execute(
+                    definitionGroups, on: plugin, errorHandling: errorHandling, progress: progress
+                )
+                result.outcomes += definitions.outcomes
+                result.cancelled = definitions.cancelled
+                result.stopped = definitions.stopped
             }
             result.joinedSessionTransaction = owner == .session
 
@@ -521,7 +522,6 @@ internal struct ObjectCopyRunner {
     ) async throws -> DataResult {
         let manager = self.manager
         let clearGroups = plan.clearGroups
-        let clearsAreSelfContained = plan.clearsAreSelfContained
         let steps = plan.dataSteps
         let sourceType = request.source.databaseType
         let targetType = request.target.databaseType
@@ -543,21 +543,17 @@ internal struct ObjectCopyRunner {
 
             var result = DataResult()
             result.joinedSessionTransaction = owner == .session
-            func clear() async {
-                let cleared = await Self.execute(
-                    clearGroups, on: targetPlugin, errorHandling: errorHandling, progress: progress
-                )
-                result.outcomes += cleared.outcomes.filter { $0.error != nil }
-                result.cancelled = cleared.cancelled
-                result.stopped = cleared.stopped
-            }
+            // Checks stay on for the clears: a table outside the copy that references a cleared one
+            // keeps its own ON DELETE rule, and MySQL cannot prove no other database holds one.
+            let cleared = await Self.execute(
+                clearGroups, on: targetPlugin, errorHandling: errorHandling, progress: progress
+            )
+            result.outcomes += cleared.outcomes.filter { $0.error != nil }
+            result.cancelled = cleared.cancelled
+            result.stopped = cleared.stopped
 
-            // A table outside the copy that references a cleared one keeps its own ON DELETE rule.
-            if !clearsAreSelfContained { await clear() }
             if !result.stopped {
                 try await Self.withForeignKeysRelaxed(on: targetPlugin, when: owner != .session) {
-                    if clearsAreSelfContained { await clear() }
-                    guard !result.stopped else { return }
                     let copied = await Self.stream(
                         steps,
                         from: sourceScope,
@@ -779,8 +775,9 @@ internal struct ObjectCopyRunner {
                     try await targetPlugin.beginTransaction(mode: .readWrite)
                 }
                 do {
+                    // Past a skipped failure a child's parent rows can be missing, and only the checks say so.
                     let outcome = try await Self.withForeignKeysRelaxed(
-                        on: targetPlugin, when: owner != .session
+                        on: targetPlugin, when: owner != .session && errorHandling != .skipAndContinue
                     ) {
                         try await copier.copy(from: sourcePlugin, to: targetPlugin) { rows in
                             progress.setRowsForCurrentObject(rows, completedBefore: completedBefore)

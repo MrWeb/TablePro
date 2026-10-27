@@ -107,10 +107,6 @@ internal struct ObjectCopyTableStep: Identifiable, Sendable {
 
     internal var id: String { selection.id }
 
-    /// Emptied before its rows go back in. A step that copies no data never is: clearing it deleted
-    /// every row the target had and wrote nothing in their place.
-    internal var clearsTarget: Bool { copiesData && !truncateStatements.isEmpty }
-
     /// What the DDL phase runs for this table. The truncate is deliberately absent: it belongs to
     /// the data phase's transaction.
     internal var ddl: [SyncStatement] { dropStatements + sequenceStatements + createStatements }
@@ -228,11 +224,6 @@ internal struct ObjectCopyPlan: Sendable {
     /// so the run may write that DDL under the target's write scope. A definition read as the
     /// session is runs as the session is, the way it did before scopes.
     internal let isStructureReadPinned: Bool
-    /// True when the plan empties tables and every foreign key in the target that points at one of
-    /// them comes from a table the plan empties too. Only then can the clears run with the target's
-    /// checks off: a key from any other table would be left pointing at rows that are gone. False
-    /// whenever the target's keys could not be read.
-    internal let clearsAreSelfContained: Bool
 
     internal init(
         request: ObjectCopyRequest,
@@ -241,8 +232,7 @@ internal struct ObjectCopyPlan: Sendable {
         definitionSteps: [ObjectCopyDefinitionStep],
         schemaStatements: [SyncStatement] = [],
         skipped: [ObjectCopySkip] = [],
-        isStructureReadPinned: Bool = false,
-        clearsAreSelfContained: Bool = false
+        isStructureReadPinned: Bool = false
     ) {
         self.request = request
         self.createsDatabase = createsDatabase
@@ -251,7 +241,6 @@ internal struct ObjectCopyPlan: Sendable {
         self.schemaStatements = schemaStatements
         self.skipped = skipped
         self.isStructureReadPinned = isStructureReadPinned
-        self.clearsAreSelfContained = clearsAreSelfContained
     }
 
     /// Shown above the script, for the caveats the copy cannot do anything about: a key column the
@@ -345,9 +334,13 @@ internal struct ObjectCopyPlan: Sendable {
     }
 
     /// Emptying the tables a data-only replace appends to, children first so a foreign key holds.
+    ///
+    /// Only a table whose rows are going back in. A step that copies no data is not in `dataSteps`,
+    /// so clearing it deletes every row the target had and writes nothing in their place: the
+    /// review said only that the two sides shared no writable column, and the run reported success.
     internal var clearGroups: [ObjectCopyStatementGroup] {
         tableSteps.reversed()
-            .filter(\.clearsTarget)
+            .filter { $0.copiesData && !$0.truncateStatements.isEmpty }
             .map { ObjectCopyStatementGroup($0.selection, $0.truncateStatements) }
     }
 
@@ -361,7 +354,7 @@ internal struct ObjectCopyPlan: Sendable {
     internal var clearsInsideDataTransaction: Bool {
         !clearGroups.isEmpty
             && request.wrapEachTableInTransaction
-            && request.errorHandling != .skipAndContinue
+            && request.errorHandling == .stopAndRollback
     }
 
     /// The definitions held back until the rows are in: a trigger fires on the copy itself, and a

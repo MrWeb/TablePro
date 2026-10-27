@@ -389,12 +389,12 @@ struct CompareForeignKeyOrderTests {
         )
     }
 
-    @Test(arguments: ["regest", "Regest"])
-    func mysqlCreatesAParentBeforeItsChild(database: String) {
+    @Test
+    func mysqlCreatesAParentBeforeItsChild() {
         let estates = table("estates")
         let buildings = table("buildings", referencing: "estates", in: "regest")
         let foreignKeys = CompareRunner.structureForeignKeys(
-            source: keyed(buildings, estates), in: mysql(database), target: [:], in: mysql("regest_copy")
+            source: keyed(buildings, estates), in: mysql("regest"), target: [:], in: mysql("regest_copy")
         )
 
         let ordered = SchemaSyncScriptBuilder.order(
@@ -403,6 +403,13 @@ struct CompareForeignKeyOrderTests {
 
         let names = ordered.map(\.tableName)
         #expect(names == ["estates", "buildings"])
+    }
+
+    /// A case-sensitive server holds `Shop` and `shop` side by side, so a key into one is not a key into the other.
+    @Test
+    func mysqlDatabasesThatDifferOnlyInCaseStayApart() {
+        #expect(mysql("Shop").names("Shop"))
+        #expect(!mysql("Shop").names("shop"))
     }
 
     @Test

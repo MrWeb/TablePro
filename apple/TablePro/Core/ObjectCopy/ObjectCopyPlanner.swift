@@ -107,9 +107,7 @@ internal struct ObjectCopyPlanner {
                 skipped: tableSkips
             ))
         }
-        let parentsFirst = Self.orderAcrossScopes(
-            &passes, slot: EngineNamespaceSlot(databaseType: request.source.databaseType)
-        )
+        let parentsFirst = Self.orderAcrossScopes(&passes)
 
         /// Every source scope of a copy to a chosen target lands in the one schema that was chosen,
         /// so the names its indexes take are allocated across scopes, not afresh for each.
@@ -157,8 +155,7 @@ internal struct ObjectCopyPlanner {
             definitionSteps: definitionSteps,
             schemaStatements: try await buildSchemaStatements(request, namespaces: targetNamespaces),
             skipped: skipped,
-            isStructureReadPinned: isStructureReadPinned,
-            clearsAreSelfContained: try await clearsAreSelfContained(request, tableSteps: tableSteps)
+            isStructureReadPinned: isStructureReadPinned
         )
     }
 
@@ -168,8 +165,7 @@ internal struct ObjectCopyPlanner {
     /// created `orders` first, because `app` was the first scope. The drafts are reordered before
     /// any step is built, because a sequence several tables share is created under the first.
     private static func orderAcrossScopes(
-        _ passes: inout [ScopePass],
-        slot: EngineNamespaceSlot
+        _ passes: inout [ScopePass]
     ) -> (ObjectCopySelection, ObjectCopySelection) -> Bool {
         var reads: [ObjectCopySelection: TableStructureRead] = [:]
         for draft in passes.flatMap(\.drafts) {
@@ -177,8 +173,7 @@ internal struct ObjectCopyPlanner {
         }
         let ordered = orderedByDependency(
             passes.map { (namespace: $0.sourceNamespace, tables: $0.drafts.map(\.selection)) },
-            reads: reads,
-            slot: slot
+            reads: reads
         )
         let rank = Dictionary(
             ordered.enumerated().map { ($0.element, $0.offset) }, uniquingKeysWith: { first, _ in first }
@@ -190,26 +185,6 @@ internal struct ObjectCopyPlanner {
             passes[index].drafts.sort { parentsFirst($0.selection, $1.selection) }
         }
         return parentsFirst
-    }
-
-    /// Asked of the target only when the plan empties a table, and in one whole-scope read.
-    private func clearsAreSelfContained(
-        _ request: ObjectCopyRequest,
-        tableSteps: [ObjectCopyTableStep]
-    ) async throws -> Bool {
-        let cleared = tableSteps.filter(\.clearsTarget).map(\.targetTable)
-        guard !cleared.isEmpty else { return false }
-        /// Every clear is in `request.target`: a duplicate creates its tables, so it empties none.
-        let target = request.target
-        let schema = target.schema?.nilIfEmpty
-        let namespace = ObjectCopyNamespace.name(for: target)
-        let slot = EngineNamespaceSlot(databaseType: target.databaseType)
-        return try await manager.withMetadataDriver(scope: targetScope(request, endpoint: target)) { driver in
-            guard let plugin = CompareMetadataService.pluginDriver(from: driver) else { return false }
-            return try await Self.clearsAreSelfContained(
-                clearing: cleared, schema: schema, namespace: namespace, slot: slot, using: plugin
-            )
-        }
     }
 
     private func sourceTableReads(
@@ -1110,8 +1085,7 @@ internal struct ObjectCopyPlanner {
     /// created before its parent and the server rejected it.
     nonisolated internal static func orderedByDependency(
         _ scopes: [(namespace: String?, tables: [ObjectCopySelection])],
-        reads: [ObjectCopySelection: TableStructureRead],
-        slot: EngineNamespaceSlot
+        reads: [ObjectCopySelection: TableStructureRead]
     ) -> [ObjectCopySelection] {
         let selections = scopes.flatMap { $0.tables }
         guard selections.count > 1 else { return selections }
@@ -1124,9 +1098,7 @@ internal struct ObjectCopyPlanner {
                 let schema = read.table.schema ?? selection.schema ?? scope.namespace
                 let node = ForeignKeyTopologicalSort.Table(name: read.table.name, schema: schema)
                 nodes.append(node)
-                foreignKeysByTable[node.identifier] = read.foreignKeys.map {
-                    pointedInto($0, namespace: node.schema, slot: slot)
-                }
+                foreignKeysByTable[node.identifier] = read.foreignKeys
                 bySortKey[node.identifier] = selection
             }
         }

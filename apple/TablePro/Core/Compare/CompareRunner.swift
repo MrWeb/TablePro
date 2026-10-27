@@ -502,19 +502,16 @@ internal struct CompareRunner {
     // What a catalog writes into `referencedSchema` for a key inside the endpoint: MySQL's database, PostgreSQL's schema.
     internal struct ReferenceNamespace {
         internal let name: String?
-        internal let slot: EngineNamespaceSlot
 
         internal init(endpoint: DatabaseEndpoint, supportsSchemas: Bool, supportsDatabases: Bool) {
             self.name = ObjectCopyNamespace.name(
                 for: endpoint, supportsSchemas: supportsSchemas, supportsDatabases: supportsDatabases
             )
-            self.slot = EngineNamespaceSlot(supportsSchemas: supportsSchemas, supportsDatabases: supportsDatabases)
         }
 
-        // A database name's case follows `lower_case_table_names`; a schema name is exact.
+        // Exact: on a case-sensitive MySQL server `Shop` and `shop` are two databases.
         internal func names(_ schema: String) -> Bool {
-            guard let name else { return false }
-            return slot == .database ? schema.lowercased() == name.lowercased() : schema == name
+            schema == name
         }
     }
 

@@ -176,15 +176,13 @@ struct ObjectCopyTransactionTests {
 
     private func dataPlan(
         _ steps: [ObjectCopyTableStep],
-        errorHandling: ImportErrorHandling = .stopAndRollback,
-        clearsAreSelfContained: Bool = false
+        errorHandling: ImportErrorHandling = .stopAndRollback
     ) -> ObjectCopyPlan {
         ObjectCopyPlan(
             request: request(steps.map(\.selection), content: .data, errorHandling: errorHandling),
             createsDatabase: false,
             tableSteps: steps,
-            definitionSteps: [],
-            clearsAreSelfContained: clearsAreSelfContained
+            definitionSteps: []
         )
     }
 
@@ -323,9 +321,9 @@ struct ObjectCopyTransactionTests {
         ])
     }
 
-    /// Relaxed, the DELETE would leave rows in a table outside the copy pointing at nothing.
-    @Test("A clear that a table outside the copy references runs before the keys are relaxed")
-    func referencedClearRunsWithKeysOn() async throws {
+    /// Relaxed, a DELETE would leave rows in a table outside the copy pointing at nothing.
+    @Test("Clears run with the target's keys on, before the rows relax them")
+    func clearsRunWithKeysOn() async throws {
         let log = CopyEventLog()
 
         _ = try await run(
@@ -338,28 +336,6 @@ struct ObjectCopyTransactionTests {
             "target begin",
             "target DELETE FROM buildings",
             "target open relaxedForeignKeys",
-            "source SELECT id FROM buildings",
-            "target insert",
-            "target close relaxedForeignKeys",
-            "target commit",
-        ])
-    }
-
-    /// A self reference or a cycle refuses its own DELETE on MySQL with the checks on.
-    @Test("Clears that only the copy's own tables reference run with the keys relaxed")
-    func selfContainedClearRunsRelaxed() async throws {
-        let log = CopyEventLog()
-
-        _ = try await run(
-            dataPlan([dataStep("buildings", clears: true)], clearsAreSelfContained: true),
-            source: RecordingCopyDriver("source", log: log),
-            target: RecordingCopyDriver("target", log: log)
-        )
-
-        #expect(log.events == [
-            "target begin",
-            "target open relaxedForeignKeys",
-            "target DELETE FROM buildings",
             "source SELECT id FROM buildings",
             "target insert",
             "target close relaxedForeignKeys",
@@ -422,8 +398,9 @@ struct ObjectCopyTransactionTests {
         #expect(log.events == ["source SELECT id FROM buildings", "target insert"])
     }
 
-    /// The table still holds its own rows, so the source's would be appended beside them.
-    @Test("Under Skip and continue a table whose clear failed gets no rows")
+    /// The table still holds its own rows, so the source's would be appended beside them. Past that
+    /// failure the rows keep the target's keys, since a child's parent rows can be missing.
+    @Test("Under Skip and continue a table whose clear failed gets no rows, and none are relaxed")
     func failedClearGetsNoRows() async throws {
         let log = CopyEventLog()
         let target = RecordingCopyDriver("target", log: log, failing: ["DELETE FROM buildings"])
@@ -442,10 +419,8 @@ struct ObjectCopyTransactionTests {
         #expect(log.events == [
             "target DELETE FROM buildings",
             "target DELETE FROM estates",
-            "target open relaxedForeignKeys",
             "source SELECT id FROM estates",
             "target insert",
-            "target close relaxedForeignKeys",
         ])
     }
 }

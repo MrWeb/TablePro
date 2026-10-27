@@ -53,7 +53,7 @@ struct ObjectCopyPlannerOrderingTests {
         reads: [ObjectCopySelection: TableStructureRead]
     ) -> [ObjectCopySelection] {
         ObjectCopyPlanner.orderedByDependency(
-            [(namespace: "public", tables: selections)], reads: reads, slot: .schema
+            [(namespace: "public", tables: selections)], reads: reads
         )
     }
 
@@ -102,29 +102,28 @@ struct ObjectCopyPlannerOrderingTests {
 
         let ordered = ObjectCopyPlanner.orderedByDependency(
             [(namespace: "app", tables: [orders]), (namespace: "core", tables: [users])],
-            reads: reads,
-            slot: .schema
+            reads: reads
         )
 
         #expect(ordered.map(\.qualifiedName) == ["core.users", "app.orders"])
     }
 
-    /// A MySQL key names its database the way the server spells it. On a server with
-    /// `lower_case_table_names` 1 the endpoint can say `Regest` while the key says `regest`.
+    /// A case-sensitive MySQL server holds `Shop` and `shop` side by side, so a key into `shop` is
+    /// no edge in `Shop`. Without one the tie-break puts `buildings` first.
     @Test
-    func aDatabaseSpelledInAnotherCaseIsTheSameDatabase() {
+    func aDatabaseSpelledInAnotherCaseIsAnotherDatabase() {
         let buildings = selection("buildings", schema: nil)
         let estates = selection("estates", schema: nil)
         let reads: [ObjectCopySelection: TableStructureRead] = [
-            buildings: read("buildings", referencing: ["estates"], referencedSchema: "regest"),
+            buildings: read("buildings", referencing: ["estates"], referencedSchema: "shop"),
             estates: read("estates")
         ]
 
         let ordered = ObjectCopyPlanner.orderedByDependency(
-            [(namespace: "Regest", tables: [buildings, estates])], reads: reads, slot: .database
+            [(namespace: "Shop", tables: [buildings, estates])], reads: reads
         )
 
-        #expect(ordered.map(\.name) == ["estates", "buildings"])
+        #expect(ordered.map(\.name) == ["buildings", "estates"])
     }
 
     /// PostgreSQL schemas `App` and `app` are two schemas, so a key into `App` is no edge in `app`.
@@ -139,7 +138,7 @@ struct ObjectCopyPlannerOrderingTests {
         ]
 
         let ordered = ObjectCopyPlanner.orderedByDependency(
-            [(namespace: "app", tables: [users, orders])], reads: reads, slot: .schema
+            [(namespace: "app", tables: [users, orders])], reads: reads
         )
 
         #expect(ordered.map(\.name) == ["orders", "users"])

@@ -200,7 +200,9 @@ struct ObjectCopyDDLSessionTests {
         let result = try await run(plan(tables: [tableStep()]), on: driver)
 
         #expect(result.failedCount == 0)
-        #expect(driver.events == ["open verbatimWrite", createTable, "close verbatimWrite"])
+        #expect(driver.events == [
+            "open relaxedForeignKeys", "open verbatimWrite", createTable, "close verbatimWrite", "close relaxedForeignKeys"
+        ])
     }
 
     @Test("A failed CREATE TABLE still closes the write scope")
@@ -210,7 +212,9 @@ struct ObjectCopyDDLSessionTests {
         let result = try await run(plan(tables: [tableStep()]), on: driver)
 
         #expect(result.failedCount == 1)
-        #expect(driver.events == ["open verbatimWrite", createTable, "close verbatimWrite"])
+        #expect(driver.events == [
+            "open relaxedForeignKeys", "open verbatimWrite", createTable, "close verbatimWrite", "close relaxedForeignKeys"
+        ])
     }
 
     /// MariaDB renders a TIMESTAMP default in the session's zone, so DDL read as the session is
@@ -221,7 +225,7 @@ struct ObjectCopyDDLSessionTests {
 
         _ = try await run(plan(tables: [tableStep()], isStructureReadPinned: false), on: driver)
 
-        #expect(driver.events == [createTable])
+        #expect(driver.events == ["open relaxedForeignKeys", createTable, "close relaxedForeignKeys"])
     }
 
     @Test("A copy between engines creates its tables under the session as it is")
@@ -230,7 +234,7 @@ struct ObjectCopyDDLSessionTests {
 
         _ = try await run(plan(from: .postgresql, tables: [tableStep()]), on: driver)
 
-        #expect(driver.events == [createTable])
+        #expect(driver.events == ["open relaxedForeignKeys", createTable, "close relaxedForeignKeys"])
     }
 
     // MARK: - Reading the source tables
@@ -289,7 +293,7 @@ struct ObjectCopyDDLSessionTests {
 
         #expect(result.failedCount == 0)
         #expect(driver.events == [
-            "open verbatimWrite", createTable, "close verbatimWrite",
+            "open relaxedForeignKeys", "open verbatimWrite", createTable, "close verbatimWrite", "close relaxedForeignKeys",
             saveMode, setMode, createProcedure, restoreMode
         ])
     }
