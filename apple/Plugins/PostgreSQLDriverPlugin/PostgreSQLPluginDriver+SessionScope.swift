@@ -96,13 +96,10 @@ internal extension PostgreSQLPluginDriver {
         let names = saved.map(\.name)
         let rows = try await core.executeSessionSetting(PostgreSQLSessionScopeSQL.captureStatement(names: names))
         let current = PostgreSQLSessionScopeSQL.settings(fromRows: rows.map { $0.map(\.asText) }, names: names)
-        // Inside a transaction a saved value can be one SET LOCAL gave it, and set back session-wide it would
-        // outlive that transaction: a `replica` role kept skipping triggers and foreign keys after the commit.
-        let local = await core.sessionTransactionState() == .inTransaction
 
         var refused: [String] = []
         for setting in PostgreSQLSessionScopeSQL.changedSettings(saved: saved, current: current) {
-            guard let statement = PostgreSQLSessionScopeSQL.setStatement([setting], local: local) else { continue }
+            guard let statement = PostgreSQLSessionScopeSQL.setStatement([setting]) else { continue }
             do {
                 _ = try await core.executeSessionSetting(statement)
             } catch {
