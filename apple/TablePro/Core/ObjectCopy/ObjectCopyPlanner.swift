@@ -108,6 +108,18 @@ internal struct ObjectCopyPlanner {
             ))
         }
         let parentsFirst = Self.orderAcrossScopes(&passes)
+        let drafts = passes.flatMap(\.drafts)
+        let keysStayInside = Self.keysStayInside(
+            passes.map { (namespace: $0.sourceNamespace, tables: $0.drafts.map(\.selection)) },
+            reads: Dictionary(drafts.map { ($0.selection, $0.read) }, uniquingKeysWith: { first, _ in first }),
+            rows: Dictionary(
+                drafts.filter(\.copiesData).map { draft in
+                    let scope = draft.rowScope
+                    return (draft.selection, !VerbatimTransferScopes.filtersRows(scope) && scope?.rowLimit == nil)
+                },
+                uniquingKeysWith: { first, _ in first }
+            )
+        )
 
         /// Every source scope of a copy to a chosen target lands in the one schema that was chosen,
         /// so the names its indexes take are allocated across scopes, not afresh for each.
@@ -155,7 +167,8 @@ internal struct ObjectCopyPlanner {
             definitionSteps: definitionSteps,
             schemaStatements: try await buildSchemaStatements(request, namespaces: targetNamespaces),
             skipped: skipped,
-            isStructureReadPinned: isStructureReadPinned
+            isStructureReadPinned: isStructureReadPinned,
+            keysStayInside: keysStayInside
         )
     }
 
@@ -1095,8 +1108,7 @@ internal struct ObjectCopyPlanner {
         for scope in scopes {
             for selection in scope.tables {
                 guard let read = reads[selection] else { continue }
-                let schema = read.table.schema ?? selection.schema ?? scope.namespace
-                let node = ForeignKeyTopologicalSort.Table(name: read.table.name, schema: schema)
+                let node = sortNode(selection, read: read, namespace: scope.namespace)
                 nodes.append(node)
                 foreignKeysByTable[node.identifier] = read.foreignKeys
                 bySortKey[node.identifier] = selection
@@ -1119,6 +1131,45 @@ internal struct ObjectCopyPlanner {
             result.append(selection)
         }
         return result
+    }
+
+    /// Whether every key a copied table holds points at a table in the copy, and, for a table that
+    /// gets rows, at one that gets all of its rows. `rows` holds each table that gets rows, true when
+    /// it gets every one.
+    ///
+    /// Only then may the target's checks be off: turning them back on checks nothing already
+    /// written, so a child copied without its parent's rows would keep pointing at nothing.
+    nonisolated internal static func keysStayInside(
+        _ scopes: [(namespace: String?, tables: [ObjectCopySelection])],
+        reads: [ObjectCopySelection: TableStructureRead],
+        rows: [ObjectCopySelection: Bool]
+    ) -> Bool {
+        var nodes: [(selection: ObjectCopySelection, read: TableStructureRead, node: ForeignKeyTopologicalSort.Table)] = []
+        for scope in scopes {
+            for selection in scope.tables {
+                guard let read = reads[selection] else { return false }
+                nodes.append((selection, read, sortNode(selection, read: read, namespace: scope.namespace)))
+            }
+        }
+        let present = Set(nodes.map(\.node.identifier))
+        let filled = Set(nodes.filter { rows[$0.selection] == true }.map(\.node.identifier))
+        return nodes.allSatisfy { entry in
+            let parents = rows[entry.selection] == nil ? present : filled
+            return entry.read.foreignKeys.allSatisfy { key in
+                let parent = ForeignKeyTopologicalSort.Table(
+                    name: key.referencedTable, schema: key.referencedSchema ?? entry.node.schema
+                )
+                return parents.contains(parent.identifier)
+            }
+        }
+    }
+
+    nonisolated private static func sortNode(
+        _ selection: ObjectCopySelection,
+        read: TableStructureRead,
+        namespace: String?
+    ) -> ForeignKeyTopologicalSort.Table {
+        ForeignKeyTopologicalSort.Table(name: read.table.name, schema: read.table.schema ?? selection.schema ?? namespace)
     }
 
     /// A view selects from a table, a routine calls a view, and a trigger hangs off a table, so the

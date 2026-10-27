@@ -253,8 +253,11 @@ internal struct ObjectCopyRunner {
         let scope = request.target.scope
         let hasCleanup = !plan.cleanupGroups.isEmpty
         let schemaStatements = plan.schemaStatements
-        // A MySQL CREATE TABLE refuses a key to a table not created yet, which a cycle always has.
-        let writesTables = tableGroups.contains { !$0.statements.isEmpty }
+        // A MySQL DROP refuses a table another references, and a CREATE a key to a table not there
+        // yet, which a cycle always has. Past a replacement, a key to a table outside the copy keeps
+        // the checks, so it still fails when that table is missing.
+        let dropsTables = plan.cleanupGroups.contains { !$0.statements.isEmpty }
+        let relaxesKeys = tableGroups.contains { !$0.statements.isEmpty } && (dropsTables || plan.keysStayInside)
         let pinsSession = plan.isStructureReadPinned && VerbatimTransferScopes.isSameEngine(
             source: request.source.databaseType, target: request.target.databaseType
         )
@@ -272,7 +275,7 @@ internal struct ObjectCopyRunner {
             var result: DDLResult
             do {
                 result = try await Self.withForeignKeysRelaxed(
-                    on: plugin, when: writesTables && !usesTransaction && owner != .session
+                    on: plugin, when: relaxesKeys && !usesTransaction && owner != .session
                 ) {
                     try await Self.executeTableDDL(
                         schemaStatements: schemaStatements,
@@ -510,24 +513,24 @@ internal struct ObjectCopyRunner {
         request: ObjectCopyRequest,
         progress: ObjectCopyProgress
     ) async throws -> DataResult {
-        guard plan.clearsInsideDataTransaction else {
+        guard plan.dataRunsInOneTransaction else {
             let steps = plan.dataSteps.filter { !uncleared.contains($0.id) }
             return await runIndependentTables(steps, request: request, progress: progress)
         }
-        return try await runClearedTables(plan, request: request, progress: progress)
+        return try await runInOneTransaction(plan, request: request, progress: progress)
     }
 
-    /// The clear and every row it makes room for, in one transaction on the target.
+    /// Every clear and every row, in one transaction on the target.
     ///
     /// Emptying a table is reversible only while the transaction that emptied it is still open, so
     /// the clears cannot run in a phase of their own once the run has promised a rollback. They
     /// still all run before any table is filled, which is what keeps a cascading foreign key from
     /// taking rows out of a table the user never selected.
     ///
-    /// One transaction for every table is the price of that promise, and it is charged only here:
-    /// a copy with nothing to empty keeps its per-table transactions, where one table's failure
-    /// leaves the tables already copied alone.
-    private func runClearedTables(
+    /// The rows relax the target's checks only here, where a failure takes every one of them back:
+    /// committed table by table, a cycle's first table would keep rows pointing at a second that
+    /// then failed.
+    private func runInOneTransaction(
         _ plan: ObjectCopyPlan,
         request: ObjectCopyRequest,
         progress: ObjectCopyProgress
@@ -539,6 +542,7 @@ internal struct ObjectCopyRunner {
         let targetType = request.target.databaseType
         let sourceScope = request.source.scope
         let errorHandling = request.errorHandling
+        let keysStayInside = plan.keysStayInside
 
         /// A lease this phase cannot take is a run-level failure with no object to pin it on, and
         /// it is thrown for the same reason the DDL phases throw it: swallowed into a stopped
@@ -565,7 +569,7 @@ internal struct ObjectCopyRunner {
             result.stopped = cleared.stopped
 
             if !result.stopped {
-                try await Self.withForeignKeysRelaxed(on: targetPlugin, when: owner != .session) {
+                try await Self.withForeignKeysRelaxed(on: targetPlugin, when: usesTransaction && keysStayInside) {
                     let copied = await Self.stream(
                         steps,
                         from: sourceScope,
@@ -584,7 +588,7 @@ internal struct ObjectCopyRunner {
             }
 
             guard usesTransaction else { return result }
-            guard result.stopped, errorHandling != .stopAndCommit else {
+            guard result.stopped else {
                 /// A commit that fails leaves the transaction open, and the clears are inside it,
                 /// so it is rolled back rather than left for the lease to decide.
                 do {
@@ -671,9 +675,10 @@ internal struct ObjectCopyRunner {
         return result
     }
 
-    /// Each table is its own unit of work, so one that fails leaves the ones already copied alone.
-    /// Both scopes are open at once, which the planner has already established is safe: two scopes
-    /// on one connection are refused unless both route to the pool.
+    /// Each batch commits as it is written, so a failure keeps what ran before it, and the target's
+    /// checks stay on: past a stop or a skipped failure a child's parent rows can be missing. Both
+    /// scopes are open at once, which the planner has already established is safe: two scopes on
+    /// one connection are refused unless both route to the pool.
     private func runIndependentTables(
         _ steps: [ObjectCopyTableStep],
         request: ObjectCopyRequest,
@@ -689,32 +694,27 @@ internal struct ObjectCopyRunner {
                 break
             }
             progress.startObject(step.qualifiedTargetName)
-            let wrapsInTransaction = request.wrapEachTableInTransaction
-                && request.errorHandling != .skipAndContinue
 
             do {
                 let copied = try await copyRows(
                     step,
                     request: request,
                     targetType: targetType,
-                    wrapsInTransaction: wrapsInTransaction,
                     completedBefore: result.rowsCopied,
                     progress: progress
                 )
                 let outcome = copied.outcome
                 result.joinedSessionTransaction =
                     result.joinedSessionTransaction || copied.joinedSessionTransaction
-                /// A cancelled table that rolled back neither counts as copied nor reads as an
-                /// object that succeeded. On a target without transactions nothing rolled back, so
-                /// the batches already flushed are in the target and saying otherwise hides them
-                /// from a user about to retry and double the rows.
+                /// Nothing rolled back, so the batches already flushed are in the target, and
+                /// saying otherwise hides them from a user about to retry and double the rows.
                 guard !outcome.cancelled else {
                     result.cancelled = true
                     result.stopped = true
-                    if outcome.committed > 0 {
-                        result.rowsCopied += outcome.committed
+                    if outcome.inserted > 0 {
+                        result.rowsCopied += outcome.inserted
                         result.outcomes.append(ObjectCopyObjectOutcome(
-                            selection: step.selection, rowsCopied: outcome.committed, error: nil
+                            selection: step.selection, rowsCopied: outcome.inserted, error: nil
                         ))
                     }
                     progress.setRowsForCurrentObject(0, completedBefore: result.rowsCopied)
@@ -735,8 +735,11 @@ internal struct ObjectCopyRunner {
                 Self.logger.error(
                     "Copy rows failed for \(step.qualifiedTargetName, privacy: .public): \(error.publicLogShape, privacy: .public)"
                 )
+                let written = (error as? ObjectCopyRowCopier.PartialFailure)?.written ?? 0
+                result.rowsCopied += written
+                progress.setRowsForCurrentObject(0, completedBefore: result.rowsCopied)
                 result.outcomes.append(ObjectCopyObjectOutcome(
-                    selection: step.selection, rowsCopied: 0, error: error.localizedDescription
+                    selection: step.selection, rowsCopied: written, error: error.localizedDescription
                 ))
                 guard request.errorHandling == .skipAndContinue else {
                     result.stopped = true
@@ -757,7 +760,6 @@ internal struct ObjectCopyRunner {
         _ step: ObjectCopyTableStep,
         request: ObjectCopyRequest,
         targetType: DatabaseType,
-        wrapsInTransaction: Bool,
         completedBefore: Int,
         progress: ObjectCopyProgress
     ) async throws -> CopiedRows {
@@ -766,7 +768,6 @@ internal struct ObjectCopyRunner {
         let copier = ObjectCopyRowCopier(
             step: step, sourceDatabaseType: request.source.databaseType, targetDatabaseType: targetType
         )
-        let errorHandling = request.errorHandling
 
         /// The injected manager on both sides. Reaching for the singleton on the target bypassed
         /// the caller's own connections and routing, which is the whole point of injecting one.
@@ -782,48 +783,10 @@ internal struct ObjectCopyRunner {
                     throw ObjectCopyError.refused(Self.noTargetDriver)
                 }
                 let owner = await Self.transactionOwner(of: targetDriver)
-                let usesTransaction = wrapsInTransaction && owner.opensTransaction
-                if usesTransaction {
-                    try await targetPlugin.beginTransaction(mode: .readWrite)
+                let outcome = try await copier.copy(from: sourcePlugin, to: targetPlugin) { rows in
+                    progress.setRowsForCurrentObject(rows, completedBefore: completedBefore)
                 }
-                do {
-                    // Past a skipped failure a child's parent rows can be missing, and only the checks say so.
-                    let outcome = try await Self.withForeignKeysRelaxed(
-                        on: targetPlugin, when: owner != .session && errorHandling != .skipAndContinue
-                    ) {
-                        try await copier.copy(from: sourcePlugin, to: targetPlugin) { rows in
-                            progress.setRowsForCurrentObject(rows, completedBefore: completedBefore)
-                        }
-                    }
-                    guard usesTransaction else {
-                        /// Nothing of the copy's own to roll back, so every batch already flushed is
-                        /// in the target, or pending in the transaction the session already held,
-                        /// whether the user stopped or not.
-                        return CopiedRows(
-                            outcome: ObjectCopyRowCopier.Outcome(
-                                inserted: outcome.inserted,
-                                cancelled: outcome.cancelled,
-                                committed: outcome.inserted
-                            ),
-                            joinedSessionTransaction: owner == .session
-                        )
-                    }
-                    if outcome.cancelled {
-                        try? await targetPlugin.rollbackTransaction()
-                    } else {
-                        try await targetPlugin.commitTransaction()
-                    }
-                    return CopiedRows(outcome: outcome, joinedSessionTransaction: false)
-                } catch {
-                    if usesTransaction {
-                        if errorHandling == .stopAndCommit {
-                            try? await targetPlugin.commitTransaction()
-                        } else {
-                            try? await targetPlugin.rollbackTransaction()
-                        }
-                    }
-                    throw error
-                }
+                return CopiedRows(outcome: outcome, joinedSessionTransaction: owner == .session)
             }
         }
     }

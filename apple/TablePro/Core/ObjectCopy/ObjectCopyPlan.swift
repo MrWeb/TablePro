@@ -224,6 +224,8 @@ internal struct ObjectCopyPlan: Sendable {
     /// so the run may write that DDL under the target's write scope. A definition read as the
     /// session is runs as the session is, the way it did before scopes.
     internal let isStructureReadPinned: Bool
+    /// `ObjectCopyPlanner.keysStayInside`: whether the target's foreign key checks may be off.
+    internal let keysStayInside: Bool
 
     internal init(
         request: ObjectCopyRequest,
@@ -232,7 +234,8 @@ internal struct ObjectCopyPlan: Sendable {
         definitionSteps: [ObjectCopyDefinitionStep],
         schemaStatements: [SyncStatement] = [],
         skipped: [ObjectCopySkip] = [],
-        isStructureReadPinned: Bool = false
+        isStructureReadPinned: Bool = false,
+        keysStayInside: Bool = false
     ) {
         self.request = request
         self.createsDatabase = createsDatabase
@@ -241,6 +244,7 @@ internal struct ObjectCopyPlan: Sendable {
         self.schemaStatements = schemaStatements
         self.skipped = skipped
         self.isStructureReadPinned = isStructureReadPinned
+        self.keysStayInside = keysStayInside
     }
 
     /// Shown above the script, for the caveats the copy cannot do anything about: a key column the
@@ -352,9 +356,14 @@ internal struct ObjectCopyPlan: Sendable {
     /// A run that promises nothing keeps them in a phase of their own, where one table's failure
     /// does not reach the tables already copied.
     internal var clearsInsideDataTransaction: Bool {
-        !clearGroups.isEmpty
-            && request.wrapEachTableInTransaction
-            && request.errorHandling == .stopAndRollback
+        !clearGroups.isEmpty && dataRunsInOneTransaction
+    }
+
+    /// Stop and roll back promises the target ends as it was, so the clears and every table's rows
+    /// are one transaction. The other two keep what ran, and PostgreSQL commits an aborted
+    /// transaction as a ROLLBACK, so their batches commit as they go.
+    internal var dataRunsInOneTransaction: Bool {
+        request.wrapEachTableInTransaction && request.errorHandling == .stopAndRollback
     }
 
     /// The definitions held back until the rows are in: a trigger fires on the copy itself, and a

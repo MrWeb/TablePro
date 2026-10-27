@@ -180,7 +180,8 @@ struct ObjectCopyDDLSessionTests {
             createsDatabase: false,
             tableSteps: tables,
             definitionSteps: definitions,
-            isStructureReadPinned: isStructureReadPinned
+            isStructureReadPinned: isStructureReadPinned,
+            keysStayInside: true
         )
     }
 

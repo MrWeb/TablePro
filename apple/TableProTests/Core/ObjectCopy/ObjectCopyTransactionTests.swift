@@ -33,7 +33,10 @@ private final class RecordingCopyDriver: PluginDriverStub, @unchecked Sendable {
     private let sessionState: PluginSessionTransactionState
     private let failing: Set<String>
     private let failsInserts: Bool
+    private let failsInsertsAfter: Int?
     private let cancelsOnInsert: Bool
+    private let rowCount: Int
+    private var inserts = 0
 
     init(
         _ name: String,
@@ -41,14 +44,18 @@ private final class RecordingCopyDriver: PluginDriverStub, @unchecked Sendable {
         sessionState: PluginSessionTransactionState = .idle,
         failing: Set<String> = [],
         failsInserts: Bool = false,
-        cancelsOnInsert: Bool = false
+        failsInsertsAfter: Int? = nil,
+        cancelsOnInsert: Bool = false,
+        rowCount: Int = 1
     ) {
         self.name = name
         self.log = log
         self.sessionState = sessionState
         self.failing = failing
         self.failsInserts = failsInserts
+        self.failsInsertsAfter = failsInsertsAfter
         self.cancelsOnInsert = cancelsOnInsert
+        self.rowCount = rowCount
     }
 
     var capabilities: PluginCapabilities { [] }
@@ -75,7 +82,11 @@ private final class RecordingCopyDriver: PluginDriverStub, @unchecked Sendable {
         record(query)
         if failing.contains(query) { throw StatementFailure() }
         return PluginQueryResult(
-            columns: ["id"], columnTypeNames: [], rows: [[.text("1")]], rowsAffected: 1, executionTime: 0
+            columns: ["id"],
+            columnTypeNames: [],
+            rows: Array(repeating: [.text("1")], count: rowCount),
+            rowsAffected: rowCount,
+            executionTime: 0
         )
     }
 
@@ -87,7 +98,8 @@ private final class RecordingCopyDriver: PluginDriverStub, @unchecked Sendable {
                 task.cancel()
             }
         }
-        if failsInserts { throw StatementFailure() }
+        inserts += 1
+        if failsInserts || inserts > failsInsertsAfter ?? .max { throw StatementFailure() }
         return PluginQueryResult(columns: [], columnTypeNames: [], rows: [], rowsAffected: 1, executionTime: 0)
     }
 
@@ -176,13 +188,15 @@ struct ObjectCopyTransactionTests {
 
     private func dataPlan(
         _ steps: [ObjectCopyTableStep],
-        errorHandling: ImportErrorHandling = .stopAndRollback
+        errorHandling: ImportErrorHandling = .stopAndRollback,
+        keysStayInside: Bool = true
     ) -> ObjectCopyPlan {
         ObjectCopyPlan(
             request: request(steps.map(\.selection), content: .data, errorHandling: errorHandling),
             createsDatabase: false,
             tableSteps: steps,
-            definitionSteps: []
+            definitionSteps: [],
+            keysStayInside: keysStayInside
         )
     }
 
@@ -298,6 +312,45 @@ struct ObjectCopyTransactionTests {
         ])
     }
 
+    /// MySQL refuses a CREATE whose key names a missing table only while the checks are on.
+    @Test("A new table relaxes the target's checks only when its keys stay inside the copy", arguments: [true, false])
+    func creationRelaxesOnlyInsideTheCopy(keysStayInside: Bool) async throws {
+        let log = CopyEventLog()
+        let base = replacementPlan(errorHandling: .stopAndCommit)
+        let created = base.tableSteps.map { step in
+            ObjectCopyTableStep(
+                selection: step.selection,
+                dropStatements: [],
+                sequenceStatements: [],
+                createStatements: step.createStatements,
+                truncateStatements: [],
+                columns: [],
+                primaryKeyColumns: step.primaryKeyColumns,
+                sourceQuery: step.sourceQuery,
+                targetTable: step.targetTable,
+                targetSchema: nil,
+                estimatedRows: nil,
+                copiesData: false,
+                copiesIdentityColumn: false,
+                note: nil
+            )
+        }
+        let plan = ObjectCopyPlan(
+            request: base.request,
+            createsDatabase: false,
+            tableSteps: created,
+            definitionSteps: [],
+            keysStayInside: keysStayInside
+        )
+
+        _ = try await run(plan, source: RecordingCopyDriver("source", log: log), target: RecordingCopyDriver("target", log: log))
+
+        let create = "target CREATE TABLE orders (id INTEGER);"
+        #expect(log.events == (keysStayInside
+            ? ["target open relaxedForeignKeys", create, "target close relaxedForeignKeys"]
+            : [create]))
+    }
+
     @Test("A schema that cannot be created rolls the structure transaction back before the lease returns")
     func failedSchemaRollsBack() async throws {
         let log = CopyEventLog()
@@ -343,6 +396,64 @@ struct ObjectCopyTransactionTests {
             "target close relaxedForeignKeys",
             "target commit",
         ])
+    }
+
+    /// Turning the checks back on checks nothing already written, so a child copied without its
+    /// parent's rows would keep pointing at nothing.
+    @Test("Rows whose keys point outside the copy keep the target's checks on")
+    func keysOutsideTheCopyKeepTheChecks() async throws {
+        let log = CopyEventLog()
+
+        _ = try await run(
+            dataPlan([dataStep("buildings")], keysStayInside: false),
+            source: RecordingCopyDriver("source", log: log),
+            target: RecordingCopyDriver("target", log: log)
+        )
+
+        #expect(log.events == [
+            "target begin", "source SELECT id FROM buildings", "target insert", "target commit",
+        ])
+    }
+
+    /// Committed table by table, a cycle's first table kept rows pointing at a second that then failed.
+    @Test("Stop and roll back writes every table's rows in one transaction")
+    func rollbackRunsTheRowsInOneTransaction() async throws {
+        let log = CopyEventLog()
+
+        let result = try await run(
+            dataPlan([dataStep("estates"), dataStep("buildings")]),
+            source: RecordingCopyDriver("source", log: log),
+            target: RecordingCopyDriver("target", log: log)
+        )
+
+        #expect(result.rowsCopied == 2)
+        #expect(log.events == [
+            "target begin",
+            "target open relaxedForeignKeys",
+            "source SELECT id FROM estates",
+            "target insert",
+            "source SELECT id FROM buildings",
+            "target insert",
+            "target close relaxedForeignKeys",
+            "target commit",
+        ])
+    }
+
+    /// PostgreSQL commits an aborted transaction as a ROLLBACK, so a table wrapped in one lost
+    /// every batch written ahead of its failure.
+    @Test("Stop and keep what ran commits each batch with the checks on, and counts what a failure kept")
+    func stopAndKeepCommitsEachBatch() async throws {
+        let log = CopyEventLog()
+
+        let result = try await run(
+            dataPlan([dataStep("buildings")], errorHandling: .stopAndCommit),
+            source: RecordingCopyDriver("source", log: log, rowCount: SQLWriteBatchBudget.maximumRows + 1),
+            target: RecordingCopyDriver("target", log: log, failsInsertsAfter: 1)
+        )
+
+        #expect(result.rowsCopied == SQLWriteBatchBudget.maximumRows)
+        #expect(result.failures.map { $0.outcome.rowsCopied } == [SQLWriteBatchBudget.maximumRows])
+        #expect(log.events == ["source SELECT id FROM buildings", "target insert", "target insert"])
     }
 
     /// Relaxed, a DELETE would leave rows in a table outside the copy pointing at nothing.

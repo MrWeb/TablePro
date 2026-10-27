@@ -404,4 +404,72 @@ struct ObjectCopyPlannerOrderingTests {
         #expect(parent < child)
         #expect(ordered.count == 3)
     }
+
+    // MARK: - Keys inside the copy
+
+    private func keysStayInside(
+        _ selections: [ObjectCopySelection],
+        reads: [ObjectCopySelection: TableStructureRead],
+        rows: [ObjectCopySelection: Bool]
+    ) -> Bool {
+        ObjectCopyPlanner.keysStayInside([(namespace: "public", tables: selections)], reads: reads, rows: rows)
+    }
+
+    @Test
+    func aCycleCopiedWholeKeepsItsKeysInside() {
+        let orders = selection("orders", schema: nil)
+        let customers = selection("customers", schema: nil)
+        let reads = [
+            orders: read("orders", referencing: ["customers"]),
+            customers: read("customers", referencing: ["orders", "customers"])
+        ]
+
+        #expect(keysStayInside([orders, customers], reads: reads, rows: [orders: true, customers: true]))
+    }
+
+    @Test
+    func aChildWithoutItsParentPointsOutside() {
+        let orders = selection("orders")
+
+        #expect(!keysStayInside([orders], reads: [orders: read("orders", referencing: ["customers"])], rows: [orders: true]))
+    }
+
+    @Test
+    func aParentMissingRowsLeavesItsChildOutside() {
+        let orders = selection("orders")
+        let customers = selection("customers")
+        let reads = [orders: read("orders", referencing: ["customers"]), customers: read("customers")]
+
+        #expect(!keysStayInside([orders, customers], reads: reads, rows: [orders: true, customers: false]))
+        #expect(!keysStayInside([orders, customers], reads: reads, rows: [orders: true]))
+    }
+
+    /// A table that gets no rows only needs its parent created, not filled.
+    @Test
+    func structureNeedsOnlyTheParentInTheCopy() {
+        let orders = selection("orders")
+        let customers = selection("customers")
+        let reads = [orders: read("orders", referencing: ["customers"]), customers: read("customers")]
+
+        #expect(keysStayInside([orders, customers], reads: reads, rows: [:]))
+    }
+
+    @Test
+    func aKeyIntoAnotherSchemaNeedsThatSchemasTable() {
+        let orders = selection("orders", schema: "app")
+        let users = selection("users", schema: "core")
+        let reads = [
+            orders: read("orders", tableSchema: "app", referencing: ["users"], referencedSchema: "core"),
+            users: read("users", tableSchema: "core")
+        ]
+
+        #expect(ObjectCopyPlanner.keysStayInside(
+            [(namespace: "app", tables: [orders]), (namespace: "core", tables: [users])],
+            reads: reads,
+            rows: [orders: true, users: true]
+        ))
+        #expect(!ObjectCopyPlanner.keysStayInside(
+            [(namespace: "app", tables: [orders])], reads: reads, rows: [orders: true]
+        ))
+    }
 }
